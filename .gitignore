@@ -81,3 +81,5 @@ docker-compose.override.yaml
 
 # Local deploy configuration (per-user, never commit)
 .deploy-env.local
+# Private upgrade skill - local only, never publish
+.claude/skills/hs-upgrade/
