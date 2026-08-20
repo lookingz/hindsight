@@ -69,7 +69,8 @@ CN deployment config stays, upstream feature code comes in.
    must be empty for each):
    `docker-compose.yaml`, `docker-compose.override.yaml.example`,
    `docker/standalone/Dockerfile.deploy`, `docker/standalone/DEPLOYMENT_CN.md`,
-   `.gitignore`, `hindsight-api-slim/tests/test_db_utils.py`,
+   `scripts/deploy-cn.sh`, `.gitignore`,
+   `hindsight-api-slim/tests/test_db_utils.py`,
    `hindsight-api-slim/tests/test_litellm_sdk_embeddings.py`.
 2. **Key semantic check** - `hindsight-api-slim/hindsight_api/engine/embeddings.py`,
    the `provider == "litellm-sdk"` factory branch must still pass
@@ -115,7 +116,9 @@ scripts/deploy-cn.sh            # fetch+reset+build+up+health check on host
 
 ## Step 6 - Smoke test
 
-On the host:
+On the host. `deploy-cn.sh` sources `.deploy-env.local` itself, but for raw
+ssh commands read `DEPLOY_HOST`/`DEPLOY_DIR` from `.deploy-env.local` (or the
+environment) first and substitute them:
 
 ```bash
 ssh "$DEPLOY_HOST" "cd $DEPLOY_DIR && ./scripts/smoke-test-slim.sh http://localhost:8888"
