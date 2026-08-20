@@ -1814,6 +1814,7 @@ def create_embeddings_from_env() -> Embeddings:
             model=config.embeddings_litellm_sdk_model,
             api_base=config.embeddings_litellm_sdk_api_base,
             output_dimensions=config.embeddings_litellm_sdk_output_dimensions,
+            batch_size=config.embeddings_openai_batch_size,
             encoding_format=config.embeddings_litellm_sdk_encoding_format,
             query_prefix=query_prefix,
             passage_prefix=passage_prefix,

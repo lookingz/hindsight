@@ -604,6 +604,23 @@ class TestLiteLLMSDKEmbeddingsFactory:
             assert isinstance(embeddings, LiteLLMSDKEmbeddings)
             assert embeddings.output_dimensions == 768
 
+    def test_create_from_env_uses_configured_openai_batch_size(self, monkeypatch):
+        """Test litellm-sdk embeddings inherit the shared OpenAI-compatible batch size."""
+        mock_config = MagicMock()
+        mock_config.embeddings_provider = "litellm-sdk"
+        mock_config.embeddings_litellm_sdk_api_key = "test_key"
+        mock_config.embeddings_litellm_sdk_model = "openai/text-embedding-v4"
+        mock_config.embeddings_litellm_sdk_api_base = "https://llm-proxy.example.com/v1"
+        mock_config.embeddings_litellm_sdk_output_dimensions = None
+        mock_config.embeddings_litellm_sdk_encoding_format = "float"
+        mock_config.embeddings_openai_batch_size = 10
+
+        with patch("hindsight_api.config.get_config", return_value=mock_config):
+            embeddings = create_embeddings_from_env()
+
+            assert isinstance(embeddings, LiteLLMSDKEmbeddings)
+            assert embeddings.batch_size == 10
+
 
 class TestLiteLLMSDKCohereEmbeddings:
     """Integration tests calling real Cohere API (matches CI pattern)."""
