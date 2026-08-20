@@ -35,13 +35,17 @@ class _FakeBackend:
 
     _wraps_backend = True
 
-    def __init__(self) -> None:
+    def __init__(self, failures_remaining: int = 0) -> None:
+        self.failures_remaining = failures_remaining
         self.acquired = 0
         self.last_conn: _FakeConnection | None = None
 
     @asynccontextmanager
     async def acquire(self):
         self.acquired += 1
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise asyncio.TimeoutError()
         conn = _FakeConnection()
         self.last_conn = conn
         try:
@@ -77,6 +81,20 @@ async def test_retryable_user_code_exception_propagates_unchanged():
     assert backend.acquired == 1
     assert backend.last_conn is not None
     assert backend.last_conn.released == 1, "connection must be released exactly once"
+
+
+@pytest.mark.asyncio
+async def test_acquire_failures_retry_before_yielding_connection():
+    """Retryable acquire failures should retry before yielding a connection."""
+
+    backend = _FakeBackend(failures_remaining=2)
+
+    async with acquire_with_retry(backend, max_retries=2) as conn:
+        assert isinstance(conn, _FakeConnection)
+
+    assert backend.acquired == 3
+    assert backend.last_conn is not None
+    assert backend.last_conn.released == 1
 
 
 def test_backoff_delay_is_jittered_and_bounded():
