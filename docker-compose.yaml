@@ -1,0 +1,83 @@
+name: hindsight-local
+
+services:
+  db:
+    # Use PostgreSQL image with vectorchord extension pre-installed
+    image: tensorchord/vchord-suite:pg16-latest
+    container_name: hindsight-db
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight}
+      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD:-hindsight_pass}
+      POSTGRES_DB: ${HINDSIGHT_DB_NAME:-hindsight}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HINDSIGHT_DB_USER:-hindsight} -d ${HINDSIGHT_DB_NAME:-hindsight}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  hindsight:
+    # Local build instructions
+    build:
+      context: .
+      dockerfile: docker/standalone/Dockerfile
+      target: standalone
+      args:
+        - INCLUDE_API=true
+        - INCLUDE_CP=true
+        - INCLUDE_LOCAL_MODELS=true
+        - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+        - HF_TOKEN=${HF_TOKEN:-}
+    container_name: hindsight-app
+    ports:
+      - "8888:8888" # API
+      - "9999:9999" # Control Plane
+    environment:
+      # Database connection
+      HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight}:${HINDSIGHT_DB_PASSWORD:-hindsight_pass}@db:5432/${HINDSIGHT_DB_NAME:-hindsight}
+
+      # Vector search extensions
+      HINDSIGHT_API_VECTOR_EXTENSION: vchord
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: vchord
+
+      # LLM Configuration (fallback to defaults if not in .env)
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-openai}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL:-gpt-4o-mini}
+      HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL}
+
+      # Embedding Configuration
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: ${HINDSIGHT_API_EMBEDDINGS_PROVIDER}
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL: ${HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL}
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_BASE: ${HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_BASE}
+      HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY: ${HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY}
+
+      # Embedding batch size (OpenAI/OpenRouter only)
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE:-100}
+
+      # Reranker
+      HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_API_RERANKER_PROVIDER:-rrf}
+
+      # HuggingFace Settings (use mirror to fix download issues in China)
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+
+      # Performance Tuning
+      HINDSIGHT_API_LLM_MAX_CONCURRENT: ${HINDSIGHT_API_LLM_MAX_CONCURRENT:-8}
+      HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: ${HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS:-65000}
+      HINDSIGHT_API_DB_COMMAND_TIMEOUT: ${HINDSIGHT_API_DB_COMMAND_TIMEOUT:-180}
+      HINDSIGHT_API_DB_STATEMENT_TIMEOUT: ${HINDSIGHT_API_DB_STATEMENT_TIMEOUT:-900}
+
+      # Other settings you may want to override from .env
+      HINDSIGHT_API_LOG_LEVEL: ${HINDSIGHT_API_LOG_LEVEL:-info}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pg_data:

@@ -1,0 +1,39 @@
+# docker-compose.override.yaml - CN deployment overrides
+# Place this file on the deployment server ONLY, do NOT commit to repo.
+# Docker Compose automatically merges this with docker-compose.yaml.
+#
+# Usage:
+#   cp docker-compose.override.yaml.example docker-compose.override.yaml
+#   edit .env and docker-compose.override.yaml
+#   docker compose build hindsight
+#   docker compose up -d
+#
+# Recommended for the `main-cn-llm-api` deployment branch:
+# - Uses `docker/standalone/Dockerfile.deploy`
+# - Supports build-time proxy via BUILD_PROXY
+# - Supports Hugging Face mirror/token via HF_ENDPOINT / HF_TOKEN
+# - Keeps local reranker / local models enabled in the image
+# - Sets a stable Hindsight worker id to avoid stuck `processing` tasks after container recreation
+# - Leaves secrets in `.env`, not in this file
+
+services:
+  db:
+    image: ghcr.1ms.run/tensorchord/vchord-suite:pg16-latest
+    environment:
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+
+  hindsight:
+    build:
+      dockerfile: docker/standalone/Dockerfile.deploy
+      args:
+        - INCLUDE_API=true
+        - INCLUDE_CP=true
+        - INCLUDE_LOCAL_MODELS=true
+        - BUILD_PROXY=${BUILD_PROXY:-}
+        - HF_TOKEN=${HF_TOKEN:-}
+    env_file:
+      - .env
+    environment:
+      HINDSIGHT_API_WORKER_ID: hindsight-app
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: native
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE: 10
