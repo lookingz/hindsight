@@ -34,8 +34,8 @@ services:
         - HF_TOKEN=${HF_TOKEN:-}
     container_name: hindsight-app
     ports:
-      - "8888:8888" # API
-      - "9999:9999" # Control Plane
+      - "127.0.0.1:8888:8888" # API (loopback only; tailnet access via Tailscale Serve)
+      - "127.0.0.1:9999:9999" # Control Plane (loopback only; tailnet access via Tailscale Serve)
     environment:
       # Database connection
       HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight}:${HINDSIGHT_DB_PASSWORD:-hindsight_pass}@db:5432/${HINDSIGHT_DB_NAME:-hindsight}
