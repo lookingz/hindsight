@@ -35,14 +35,14 @@ RUN if [ "$INCLUDE_API" != "true" ]; then echo "Skipping API build" && exit 0; f
 WORKDIR /app
 
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get update && apt-get install -y \
     gcc \
     g++ \
     curl \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
+    && pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv
 
 COPY hindsight-api-slim/pyproject.toml ./api/
 COPY hindsight-api-slim/README.md ./api/
@@ -133,7 +133,7 @@ FROM python:3.11-slim AS api-only
 WORKDIR /app
 
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get update && apt-get install -y \
     curl \
@@ -144,7 +144,7 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     libossp-uuid16 \
     && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
+    && pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv
 
 RUN useradd -m -s /bin/bash hindsight
 
@@ -237,7 +237,7 @@ WORKDIR /app
 COPY docker/standalone/start-all.sh /app/start-all.sh
 RUN chmod +x /app/start-all.sh
 
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apk/repositories && \
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
     apk add --no-cache curl bash
 
 EXPOSE 9999
@@ -259,7 +259,7 @@ WORKDIR /app
 ARG BUILD_PROXY
 RUN if [ -n "$BUILD_PROXY" ]; then export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY"; fi && \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get update && apt-get install -y \
     curl \
@@ -272,7 +272,7 @@ RUN if [ -n "$BUILD_PROXY" ]; then export http_proxy="$BUILD_PROXY" https_proxy=
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+    && pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv
 
 RUN useradd -m -s /bin/bash hindsight
 
