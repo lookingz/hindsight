@@ -178,15 +178,17 @@ async def test_batch_api_normal_flow(mock_llm_config, test_contents, hindsight_c
         mock_llm_config._provider_impl.retrieve_batch_results = AsyncMock(return_value=mock_results)
 
         # Call batch API extraction
-        facts, chunks, usage = await extract_facts_from_contents_batch_api(
+        extraction = await extract_facts_from_contents_batch_api(
             contents=test_contents,
             llm_config=mock_llm_config,
-            agent_name="test_agent",
             config=hindsight_config,
             pool=None,  # No DB pool for this test
             operation_id=None,
             schema=None,
         )
+        facts = extraction.facts
+        chunks = extraction.chunks
+        usage = extraction.usage
 
         # Verify results
         assert len(facts) == 2, "Should extract 2 facts (one per chunk)"
@@ -266,15 +268,17 @@ async def test_batch_api_accepts_top_level_fact_list(mock_llm_config, test_conte
         ]
     )
 
-    facts, chunks, usage = await extract_facts_from_contents_batch_api(
+    extraction = await extract_facts_from_contents_batch_api(
         contents=[test_contents[0]],
         llm_config=mock_llm_config,
-        agent_name="test_agent",
         config=hindsight_config,
         pool=None,
         operation_id=None,
         schema=None,
     )
+    facts = extraction.facts
+    chunks = extraction.chunks
+    usage = extraction.usage
 
     assert len(facts) == 1
     assert "Alice" in facts[0].fact_text
@@ -306,15 +310,17 @@ async def test_batch_api_rejects_top_level_non_fact_list(mock_llm_config, test_c
         ]
     )
 
-    facts, chunks, usage = await extract_facts_from_contents_batch_api(
+    extraction = await extract_facts_from_contents_batch_api(
         contents=[test_contents[0]],
         llm_config=mock_llm_config,
-        agent_name="test_agent",
         config=hindsight_config,
         pool=None,
         operation_id=None,
         schema=None,
     )
+    facts = extraction.facts
+    chunks = extraction.chunks
+    usage = extraction.usage
 
     assert facts == []
     assert len(chunks) == 1
@@ -375,15 +381,16 @@ async def test_batch_api_records_schema_drifted_facts_as_extraction_errors(
         "hindsight_api.engine.retain.fact_extraction._write_batch_extraction_errors",
         side_effect=_capture,
     ):
-        facts, chunks, _usage = await extract_facts_from_contents_batch_api(
+        extraction = await extract_facts_from_contents_batch_api(
             contents=[test_contents[0]],
             llm_config=mock_llm_config,
-            agent_name="test_agent",
             config=hindsight_config,
             pool=None,
             operation_id=None,
             schema=None,
         )
+        facts = extraction.facts
+        chunks = extraction.chunks
 
     assert facts == []
     assert chunks[0].fact_count == 0
@@ -443,15 +450,17 @@ async def test_batch_api_recovers_fenced_and_control_char_json(mock_llm_config, 
         ]
     )
 
-    facts, chunks, usage = await extract_facts_from_contents_batch_api(
+    extraction = await extract_facts_from_contents_batch_api(
         contents=[test_contents[0]],
         llm_config=mock_llm_config,
-        agent_name="test_agent",
         config=hindsight_config,
         pool=None,
         operation_id=None,
         schema=None,
     )
+    facts = extraction.facts
+    chunks = extraction.chunks
+    usage = extraction.usage
 
     # The facts are recovered rather than lost.
     assert len(facts) == 1
@@ -492,15 +501,17 @@ async def test_batch_api_unparseable_json_still_records_error(mock_llm_config, t
         ]
     )
 
-    facts, chunks, usage = await extract_facts_from_contents_batch_api(
+    extraction = await extract_facts_from_contents_batch_api(
         contents=[test_contents[0]],
         llm_config=mock_llm_config,
-        agent_name="test_agent",
         config=hindsight_config,
         pool=None,
         operation_id=None,
         schema=None,
     )
+    facts = extraction.facts
+    chunks = extraction.chunks
+    usage = extraction.usage
 
     assert facts == []
     assert len(chunks) == 1
@@ -619,15 +630,17 @@ async def test_batch_api_crash_recovery(mock_llm_config, test_contents, hindsigh
         mock_llm_config._provider_impl.retrieve_batch_results = AsyncMock(return_value=mock_results)
 
         # Call batch API extraction with operation_id (crash recovery scenario)
-        facts, chunks, usage = await extract_facts_from_contents_batch_api(
+        extraction = await extract_facts_from_contents_batch_api(
             contents=test_contents,
             llm_config=mock_llm_config,
-            agent_name="test_agent",
             config=hindsight_config,
             pool=pool,
             operation_id=operation_id,  # Provides crash recovery context
             schema=schema,
         )
+        facts = extraction.facts
+        chunks = extraction.chunks
+        usage = extraction.usage
 
         # Verify results
         assert len(facts) == 2, "Should extract 2 facts after recovery"
@@ -720,15 +733,17 @@ async def test_batch_api_records_non_fatal_extraction_errors(
             ]
         )
 
-        facts, chunks, usage = await extract_facts_from_contents_batch_api(
+        extraction = await extract_facts_from_contents_batch_api(
             contents=test_contents,
             llm_config=mock_llm_config,
-            agent_name="test_agent",
             config=hindsight_config,
             pool=pool,
             operation_id=operation_id,
             schema=schema,
         )
+        facts = extraction.facts
+        chunks = extraction.chunks
+        usage = extraction.usage
 
         assert len(facts) == 1
         assert len(chunks) == 2
@@ -767,7 +782,6 @@ async def test_batch_api_raises_for_unsupported_provider(mock_llm_config, test_c
         await extract_facts_from_contents_batch_api(
             contents=test_contents,
             llm_config=mock_llm_config,
-            agent_name="test_agent",
             config=hindsight_config,
             pool=None,
             operation_id=None,
@@ -894,15 +908,17 @@ async def test_batch_api_via_extract_facts_from_contents(
         )
 
         # Call main extract_facts_from_contents (should route to batch API)
-        facts, chunks, usage = await extract_facts_from_contents(
+        extraction = await extract_facts_from_contents(
             contents=test_contents,
             llm_config=mock_llm_config,
-            agent_name="test_agent",
             config=hindsight_config,
             pool=None,
             operation_id=None,
             schema=None,
         )
+        facts = extraction.facts
+        chunks = extraction.chunks
+        usage = extraction.usage
 
         # Verify batch API was called
         mock_llm_config._provider_impl.submit_batch.assert_called_once()
@@ -962,15 +978,15 @@ async def test_batch_api_sanitizes_model_authored_text(mock_llm_config, hindsigh
         ]
     )
 
-    facts, _chunks, _usage = await extract_facts_from_contents_batch_api(
+    extraction = await extract_facts_from_contents_batch_api(
         contents=[RetainContent(content="Alex laughed at the joke.")],
         llm_config=mock_llm_config,
-        agent_name="test_agent",
         config=hindsight_config,
         pool=None,
         operation_id=None,
         schema=None,
     )
+    facts = extraction.facts
 
     assert len(facts) == 1
     assert facts[0].fact_text.encode("utf-8")  # raised UnicodeEncodeError before the fix

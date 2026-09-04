@@ -5,6 +5,7 @@ The SearchTracer collects comprehensive information about each step
 of the spreading activation search process for debugging and visualization.
 """
 
+import logging
 import time
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -12,7 +13,6 @@ from typing import Any, Literal
 from .trace import (
     EntryPoint,
     NodeVisit,
-    PruningDecision,
     QueryInfo,
     RerankedResult,
     RetrievalMethodResults,
@@ -24,6 +24,8 @@ from .trace import (
     TemporalConstraint,
     WeightComponents,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SearchTracer:
@@ -38,7 +40,6 @@ class SearchTracer:
         tracer.record_query_embedding(embedding)
         tracer.add_entry_point(node_id, text, similarity, rank)
         tracer.visit_node(...)
-        tracer.prune_node(...)
 
         # After search...
         trace = tracer.finalize(final_results)
@@ -80,7 +81,6 @@ class SearchTracer:
         self.start_time: float | None = None
         self.entry_points: list[EntryPoint] = []
         self.visits: list[NodeVisit] = []
-        self.pruned: list[PruningDecision] = []
         self.phase_metrics: list[SearchPhaseMetrics] = []
 
         # Temporal constraint detected from query
@@ -94,11 +94,6 @@ class SearchTracer:
         # Tracking state
         self.current_step = 0
         self.nodes_visited_set = set()  # For quick lookups
-
-        # Link statistics
-        self.temporal_links_followed = 0
-        self.semantic_links_followed = 0
-        self.entity_links_followed = 0
 
     def start(self):
         """Start timing the search."""
@@ -146,9 +141,6 @@ class SearchTracer:
         context: str,
         event_date: datetime | None,
         is_entry_point: bool,
-        parent_node_id: str | None,
-        link_type: Literal["temporal", "semantic", "entity"] | None,
-        link_weight: float | None,
         activation: float,
         semantic_similarity: float,
         recency: float,
@@ -164,9 +156,6 @@ class SearchTracer:
             context: Memory unit context
             event_date: When the memory occurred
             is_entry_point: Whether this is an entry point
-            parent_node_id: Node that led here (None for entry points)
-            link_type: Type of link from parent
-            link_weight: Weight of link from parent
             activation: Activation score
             semantic_similarity: Semantic similarity to query
             recency: Recency weight
@@ -208,46 +197,11 @@ class SearchTracer:
             context=context,
             event_date=event_date,
             is_entry_point=is_entry_point,
-            parent_node_id=parent_node_id,
-            link_type=link_type,
-            link_weight=link_weight,
             weights=weights,
-            neighbors_explored=[],
             final_rank=None,  # Will be set later
         )
 
         self.visits.append(visit)
-
-        # Track link statistics
-        if link_type == "temporal":
-            self.temporal_links_followed += 1
-        elif link_type == "semantic":
-            self.semantic_links_followed += 1
-        elif link_type == "entity":
-            self.entity_links_followed += 1
-
-    def prune_node(
-        self,
-        node_id: str,
-        reason: Literal["already_visited", "activation_too_low", "budget_exhausted"],
-        activation: float,
-    ):
-        """
-        Record a node being pruned (not visited).
-
-        Args:
-            node_id: Node that was pruned
-            reason: Why it was pruned
-            activation: Activation value when pruned
-        """
-        self.pruned.append(
-            PruningDecision(
-                node_id=node_id,
-                reason=reason,
-                activation=activation,
-                would_have_been_step=self.current_step + 1,
-            )
-        )
 
     def add_phase_metric(self, phase_name: str, duration_seconds: float, details: dict[str, Any] | None = None):
         """
@@ -265,6 +219,22 @@ class SearchTracer:
                 details=details or {},
             )
         )
+        # Every recall phase already funnels through here, and the tracer is constructed for EVERY
+        # recall so the `[phases]` line has somewhere to write -- so this is the one place that
+        # turns a per-request log line into an aggregate, with no new timers and no per-request
+        # flag for a caller to remember.
+        #
+        # Instrumentation must never be the thing that fails the request it measures.
+        try:
+            from ...metrics import get_metrics_collector
+
+            get_metrics_collector().record_recall_phase(
+                phase_name,
+                duration_seconds,
+                diagnostic=bool((details or {}).get("diagnostic")),
+            )
+        except Exception:
+            logger.debug("recall phase metrics not recorded", exc_info=True)
 
     def add_retrieval_results(
         self,
@@ -434,15 +404,11 @@ class SearchTracer:
         # Create summary
         summary = SearchSummary(
             total_nodes_visited=len(self.visits),
-            total_nodes_pruned=len(self.pruned),
             entry_points_found=len(self.entry_points),
             budget_used=len(self.visits),
             budget_remaining=self.budget - len(self.visits),
             total_duration_seconds=total_duration,
             results_returned=len(final_results),
-            temporal_links_followed=self.temporal_links_followed,
-            semantic_links_followed=self.semantic_links_followed,
-            entity_links_followed=self.entity_links_followed,
             phase_metrics=self.phase_metrics,
         )
 
@@ -454,7 +420,6 @@ class SearchTracer:
             reranked=self.reranked,
             entry_points=self.entry_points,
             visits=self.visits,
-            pruned=self.pruned,
             summary=summary,
             final_results=final_results,
         )

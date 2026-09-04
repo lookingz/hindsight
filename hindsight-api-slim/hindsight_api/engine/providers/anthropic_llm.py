@@ -17,8 +17,10 @@ from typing import Any, Callable
 
 from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.structured_output import provider_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
@@ -74,6 +76,11 @@ def _mark_last_message_for_caching(messages: list[dict[str, Any]]) -> None:
         content[-1]["cache_control"] = _EPHEMERAL_CACHE
 
 
+# Fallback per-request timeout when the caller resolved none (direct
+# construction, tests). Configured deployments pass one down.
+_DEFAULT_ANTHROPIC_TIMEOUT = 300.0
+
+
 class AnthropicLLM(LLMInterface):
     """
     LLM provider using Anthropic's Claude models.
@@ -89,7 +96,7 @@ class AnthropicLLM(LLMInterface):
         base_url: str,
         model: str,
         reasoning_effort: str | None = None,
-        timeout: float = 300.0,
+        timeout: float | None = None,
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -103,7 +110,9 @@ class AnthropicLLM(LLMInterface):
             base_url: Base URL for the API (optional, uses Anthropic default if empty).
             model: Model name (e.g., "claude-sonnet-4-20250514").
             reasoning_effort: Reasoning effort level (not used by Anthropic).
-            timeout: Request timeout in seconds.
+            timeout: Per-request timeout in seconds, resolved by the caller from
+                ``llm_timeout`` / the per-operation override. ``None`` (direct
+                construction, tests) falls back to ``_DEFAULT_ANTHROPIC_TIMEOUT``.
             default_headers: Optional custom headers passed as ``default_headers`` to
                 the Anthropic SDK client. Used by operators routing through proxies
                 or request-tracing middleware. Sourced from ``llm_default_headers`` in
@@ -114,7 +123,7 @@ class AnthropicLLM(LLMInterface):
                 Sourced from ``llm_extra_body`` (env: ``HINDSIGHT_API_LLM_EXTRA_BODY``).
             **kwargs: Additional provider-specific parameters.
         """
-        super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
+        super().__init__(provider, api_key, base_url, model, reasoning_effort, timeout=timeout, **kwargs)
         self._warn_reasoning_effort_unsupported()
 
         if not self.api_key:
@@ -133,8 +142,8 @@ class AnthropicLLM(LLMInterface):
             client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
-            if timeout:
-                client_kwargs["timeout"] = timeout
+            # Per-phase so the connect leg is capped independently (issue #3881).
+            client_kwargs["timeout"] = build_sdk_timeout(self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT)
             if default_headers:
                 client_kwargs["default_headers"] = default_headers
 
@@ -233,7 +242,7 @@ class AnthropicLLM(LLMInterface):
         use_forced_tool = False
         _tool_name = "structured_response"
         if response_format is not None and hasattr(response_format, "model_json_schema"):
-            schema = response_format.model_json_schema()
+            schema = provider_json_schema(response_format)
             if strict_schema:
                 use_forced_tool = True
             else:
@@ -408,7 +417,8 @@ class AnthropicLLM(LLMInterface):
                         await asyncio.sleep(backoff + jitter)
                         continue
 
-                logger.error(f"Anthropic API error after {max_retries + 1} attempts: {str(e)}")
+                detail = f" [{describe_transport_error(e)}]" if isinstance(e, APIConnectionError) else ""
+                logger.error(f"Anthropic API error after {max_retries + 1} attempts: {str(e)}{detail}")
                 raise
 
             except Exception as e:
@@ -606,6 +616,11 @@ class AnthropicLLM(LLMInterface):
                 # Diagnostic dump (opt-in) of the exact request behind any 4xx.
                 dump_request_on_4xx(scope=scope, provider=self.provider, model=self.model, err=e, request=call_params)
                 last_exception = e
+                if isinstance(e, APIConnectionError):
+                    logger.warning(
+                        f"APIConnectionError in tool call ({self.provider}/{self.model}, scope={scope}, "
+                        f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]} [{describe_transport_error(e)}]"
+                    )
                 if attempt < max_retries:
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
                     continue

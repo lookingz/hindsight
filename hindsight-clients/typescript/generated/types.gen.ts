@@ -2670,7 +2670,7 @@ export type LabelGroupInput = {
   /**
    * Type
    */
-  type?: "value" | "multi-values" | "text" | "map";
+  type?: "value" | "multi-values" | "text" | "multi-text" | "map";
   /**
    * Optional
    */
@@ -2708,7 +2708,7 @@ export type LabelGroupOutput = {
   /**
    * Type
    */
-  type?: "value" | "multi-values" | "text" | "map";
+  type?: "value" | "multi-values" | "text" | "multi-text" | "map";
   /**
    * Optional
    */
@@ -2913,7 +2913,7 @@ export type MapFieldInput = {
   /**
    * Type
    */
-  type?: "text" | "value" | "multi-values" | "map";
+  type?: "text" | "multi-text" | "value" | "multi-values" | "map";
   /**
    * Description
    */
@@ -2939,7 +2939,7 @@ export type MapFieldOutput = {
   /**
    * Type
    */
-  type?: "text" | "value" | "multi-values" | "map";
+  type?: "text" | "multi-text" | "value" | "multi-values" | "map";
   /**
    * Description
    */
@@ -4219,7 +4219,7 @@ export type RecallRequest = {
   /**
    * Tag Groups
    *
-   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
@@ -4593,7 +4593,7 @@ export type ReflectRequest = {
   /**
    * Tag Groups
    *
-   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags.
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags. A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
@@ -4750,7 +4750,8 @@ export type RefreshMentalModelOperationDetails = {
     | "content_preserved_no_new_facts"
     | "refresh_failed_empty_candidate"
     | "refresh_failed_delta_not_applied"
-    | "refresh_failed_structured_output";
+    | "refresh_failed_structured_output"
+    | "refresh_failed_error";
   /**
    * Failure Reason
    *
@@ -4763,6 +4764,9 @@ export type RefreshMentalModelOperationDetails = {
     | "delta_ops_all_skipped"
     | "delta_not_applied"
     | "structured_output_failed"
+    | "retrieval_failed"
+    | "no_answer"
+    | "unexpected_error"
     | null;
 };
 
@@ -4938,6 +4942,10 @@ export type TagGroupLeaf = {
    * Match
    */
   match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+  /**
+   * Resolve
+   */
+  resolve?: "exact" | "fuzzy";
 };
 
 /**

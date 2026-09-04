@@ -19,7 +19,7 @@ from ..llm_interface import ProviderContentPolicyError, ProviderRateLimitResetEr
 from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output, sanitize_llm_value
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
-from ..structured_output import strict_json_schema
+from ..structured_output import provider_json_schema, strict_json_schema
 from .entity_labels import (
     EntityLabelsConfig,
     MapField,
@@ -54,7 +54,7 @@ def _extract_map_entities(
                         validated_entities,
                         existing_texts_lower,
                     )
-        elif map_field.type == "multi-values":
+        elif map_field.type in ("multi-values", "multi-text"):
             vals = field_val if isinstance(field_val, list) else [field_val]
             for v in vals:
                 if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
@@ -1167,6 +1167,8 @@ def _append_map_fields_prompt(fields: dict[str, "MapField"], lines: list[str], i
         if map_field.type == "map" and map_field.fields:
             lines.append(f"{pad}• {field_name} (object){field_desc}")
             _append_map_fields_prompt(map_field.fields, lines, indent + 4)
+        elif map_field.type == "multi-text":
+            lines.append(f"{pad}• {field_name} (list of free text, [] if none){field_desc}")
         elif map_field.type == "multi-values":
             vals = ", ".join(v.value for v in map_field.values if v.value)
             type_hint = f"multi-values: {vals}" if vals else "multi-values"
@@ -1221,6 +1223,9 @@ def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, f
         if attr.type == "text":
             # Free-text: no predefined values — LLM writes any relevant string or null
             lines.append(f"- {attr.key} (free text or null): {attr.description}")
+        elif attr.type == "multi-text":
+            # Open vocabulary: no predefined values — LLM writes as many strings as the content warrants
+            lines.append(f"- {attr.key} (list of free text, empty list if none): {attr.description}")
         else:
             mode = "multi-value (list)" if attr.type == "multi-values" else "single value or null"
             lines.append(f"- {attr.key} ({mode}): {attr.description}")
@@ -1533,7 +1538,7 @@ def _build_request_body(batch_impl, config, prompt: str, user_message: str, resp
     # fallback, so the batch and streaming paths can't disagree.
     if hasattr(response_schema, "model_json_schema"):
         retain_strict_schema = config.llm_strict_schema_retain
-        schema = strict_json_schema(response_schema) if retain_strict_schema else response_schema.model_json_schema()
+        schema = strict_json_schema(response_schema) if retain_strict_schema else provider_json_schema(response_schema)
         request_body["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": "facts", "schema": schema, "strict": retain_strict_schema},
@@ -1559,7 +1564,7 @@ async def _extract_facts_from_chunk(
     context: str,
     llm_config: "LLMConfig",
     config,
-    agent_name: str = None,
+    agent_name: str | None = None,
     metadata: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
@@ -1822,7 +1827,7 @@ async def _extract_facts_from_chunk(
                                 if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
                                     continue
                                 label_str = f"{group.key}:{v.strip()}"
-                                if group.type == "text":
+                                if group.type in ("text", "multi-text"):
                                     if label_str.lower() not in existing_texts_lower:
                                         validated_entities.append(label_str)
                                         existing_texts_lower.add(label_str.lower())
@@ -1963,7 +1968,7 @@ async def _extract_facts_with_auto_split(
     context: str,
     llm_config: LLMConfig,
     config,
-    agent_name: str = None,
+    agent_name: str | None = None,
     metadata: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
@@ -2069,10 +2074,10 @@ async def extract_facts_from_text(
     text: str,
     event_date: datetime | None,
     llm_config: LLMConfig,
-    agent_name: str,
     config,
     context: str = "",
     metadata: dict[str, str] | None = None,
+    agent_name: str | None = None,
 ) -> tuple[list[Fact], list[tuple[str, int]], TokenUsage]:
     """
     Extract semantic facts from conversational or narrative text using LLM.
@@ -2087,10 +2092,12 @@ async def extract_facts_from_text(
         text: Input text (conversation, article, etc.)
         event_date: Reference date for resolving relative times
         llm_config: LLM configuration to use
-        agent_name: Agent name (memory owner)
         config: Resolved HindsightConfig for this bank
         context: Context about the conversation/document
         metadata: Optional document metadata key-value pairs
+        agent_name: Optional narrator to prime the prompt with ("Narrator: {name}").
+            Retain never sets it — see the caller in retain/orchestrator.py — and the
+            dry-run endpoint's field that does is deprecated in favour of ``context``.
 
     Returns:
         Tuple of (facts, chunks, usage) where:
@@ -2203,7 +2210,7 @@ async def extract_facts_from_text(
 # Import types for the orchestration layer (note: ExtractedFact here is different from the Pydantic model above)
 
 from .types import CausalRelation as CausalRelationType
-from .types import ChunkMetadata, RetainContent
+from .types import ChunkMetadata, ExtractionResult, RetainContent
 from .types import ExtractedFact as ExtractedFactType
 
 logger = logging.getLogger(__name__)
@@ -2248,12 +2255,11 @@ async def _write_batch_extraction_errors(
 async def extract_facts_from_contents_batch_api(
     contents: list[RetainContent],
     llm_config,
-    agent_name: str,
     config,
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+) -> ExtractionResult:
     """
     Extract facts using LLM Batch API (OpenAI/Groq).
 
@@ -2263,17 +2269,16 @@ async def extract_facts_from_contents_batch_api(
     Args:
         contents: List of RetainContent objects to process
         llm_config: LLM configuration with batch API support
-        agent_name: Name of the agent
         config: Resolved HindsightConfig for this bank
         pool: Database connection pool (for storing batch state)
         operation_id: Async operation ID (for crash recovery)
         schema: Database schema (for multi-tenant support)
 
     Returns:
-        Tuple of (extracted_facts, chunks_metadata, usage)
+        An ExtractionResult carrying the facts, their chunk metadata, and token usage.
     """
     if not contents:
-        return [], [], TokenUsage()
+        return ExtractionResult([], [], TokenUsage())
 
     logger.info(f"Using Batch API for fact extraction ({len(contents)} contents)")
 
@@ -2380,7 +2385,6 @@ async def extract_facts_from_contents_batch_api(
                 item.event_date,
                 item.context,
                 item.metadata or None,
-                agent_name,
                 mission_preamble=_retain_mission_preamble(config),
             )
 
@@ -2392,7 +2396,7 @@ async def extract_facts_from_contents_batch_api(
             )
 
     if not batch_requests and not batch_id:  # No requests and not resuming
-        return [], [], TokenUsage()
+        return ExtractionResult([], [], TokenUsage())
 
     # Step 2: Submit batch (skip if resuming)
     if not batch_id:
@@ -2666,7 +2670,7 @@ async def extract_facts_from_contents_batch_api(
                             if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
                                 continue
                             label_str = f"{group.key}:{v.strip()}"
-                            if group.type == "text":
+                            if group.type in ("text", "multi-text"):
                                 if label_str.lower() not in existing_texts_lower:
                                     validated_entities.append(label_str)
                                     existing_texts_lower.add(label_str.lower())
@@ -2795,13 +2799,13 @@ async def extract_facts_from_contents_batch_api(
 
     logger.info(f"Batch API extracted {len(extracted_facts)} facts from {len(all_chunks_info)} chunks")
 
-    return extracted_facts, chunks_metadata, total_usage
+    return ExtractionResult(extracted_facts, chunks_metadata, total_usage)
 
 
 def _extract_facts_chunks(
     contents: list[RetainContent],
     config,
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+) -> ExtractionResult:
     """
     chunks mode: no LLM call, no entity extraction.
 
@@ -2845,18 +2849,17 @@ def _extract_facts_chunks(
             global_chunk_idx += 1
 
     _add_temporal_offsets(extracted_facts, contents)
-    return extracted_facts, chunks_metadata, TokenUsage()
+    return ExtractionResult(extracted_facts, chunks_metadata, TokenUsage())
 
 
 async def extract_facts_from_contents(
     contents: list[RetainContent],
     llm_config,
-    agent_name: str,
     config,
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+) -> ExtractionResult:
     """
     Extract facts from multiple content items in parallel.
 
@@ -2871,17 +2874,16 @@ async def extract_facts_from_contents(
     Args:
         contents: List of RetainContent objects to process
         llm_config: LLM configuration for fact extraction
-        agent_name: Name of the agent (for agent-related fact detection)
         config: Resolved HindsightConfig for this bank
         pool: Database connection pool (passed to batch API for state storage)
         operation_id: Async operation ID (passed to batch API for crash recovery)
         schema: Database schema (passed to batch API for multi-tenant support)
 
     Returns:
-        Tuple of (extracted_facts, chunks_metadata, usage)
+        An ExtractionResult carrying the facts, their chunk metadata, and token usage.
     """
     if not contents:
-        return [], [], TokenUsage()
+        return ExtractionResult([], [], TokenUsage())
 
     # chunks mode: skip LLM entirely, store each chunk as-is
     # Must come before the batch-API check so no LLM queue/locks are acquired
@@ -2890,9 +2892,7 @@ async def extract_facts_from_contents(
 
     # Route to batch API if enabled
     if config.retain_batch_enabled:
-        return await extract_facts_from_contents_batch_api(
-            contents, llm_config, agent_name, config, pool, operation_id, schema
-        )
+        return await extract_facts_from_contents_batch_api(contents, llm_config, config, pool, operation_id, schema)
 
     # Step 1: Create parallel fact extraction tasks
     fact_extraction_tasks = []
@@ -2903,7 +2903,6 @@ async def extract_facts_from_contents(
             event_date=item.event_date,
             context=item.context,
             llm_config=llm_config,
-            agent_name=agent_name,
             config=config,
             metadata=item.metadata or None,
         )
@@ -2997,7 +2996,7 @@ async def extract_facts_from_contents(
     # Step 6: Auto-tag facts from label groups with tag=True
     _inject_label_tags(extracted_facts, config)
 
-    return extracted_facts, chunks_metadata, total_usage
+    return ExtractionResult(extracted_facts, chunks_metadata, total_usage)
 
 
 def _collapse_to_verbatim(facts: list[ExtractedFactType], chunks: list[ChunkMetadata]) -> list[ExtractedFactType]:

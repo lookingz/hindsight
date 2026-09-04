@@ -714,7 +714,7 @@ class MemoriesExtension(Extension, ABC):
     #:
     #: True is a store that keeps memories elsewhere. It owns a dedicated document store (bodies go
     #: through ``put_document`` / ``get_document_record`` / ``get_chunk_text`` / ``list_chunk_texts``
-    #: / ``count_chunks`` / ``document_content_hash``), resolves entity NAMES itself, and commits the
+    #: / ``document_content_hash``), resolves entity NAMES itself, and commits the
     #: entire retain — resolution, upserts and the document replace — as ONE atomic server-side call
     #: (``retain``). The orchestrator then needs no Postgres connection phase for it.
     #:
@@ -1195,10 +1195,6 @@ class MemoriesExtension(Extension, ABC):
 
     async def list_chunk_texts(self, *, bank_id: str, document_id: str) -> "list[str] | None":
         """Every chunk's text in order, or ``None`` if the document does not exist."""
-        raise NotImplementedError
-
-    async def count_chunks(self, *, bank_id: str, document_id: str) -> int:
-        """How many chunks a document has (0 if it does not exist)."""
         raise NotImplementedError
 
     async def set_document_tags(self, *, bank_id: str, document_id: str, tags: "list[str]") -> None:
@@ -1702,15 +1698,21 @@ class MemoriesExtension(Extension, ABC):
 
     @abstractmethod
     async def set_memory_embedding(self, *, conn, fq_table, bank_id: str, unit_id: str, embedding) -> None:
-        """Write a memory's embedding, recomputed by the caller.
+        """Write a memory's embedding, recomputed by the caller, leaving its fields as they are.
 
         Its own method because the general :meth:`update_memories` is a no-op for
-        the store whose write is the row itself — reverting or editing a memory has
-        to put a freshly computed vector back on it, so this is a real write for
-        both. ``embedding`` is a float list or the pgvector literal.
+        the store whose write is the row itself — restoring an invalidated memory has
+        to put a freshly computed vector back on it, so this is a real write.
+        ``embedding`` is a float list or the pgvector literal.
+
+        A curation edit no longer arrives here. It used to call this straight after
+        :meth:`apply_edit` — a second write of the row that call had just written, which
+        for a store whose write is a durable append is the whole cost of the edit again —
+        so the vector now rides the edit itself as ``apply_edit(embedding=...)``. What is
+        left for this method is writing a vector when no field is changing alongside it.
 
         The vector is part of the memory, so this stamps ``updated_at`` itself rather
-        than leaning on the edit statement its in-tree callers happen to pair it with
+        than leaning on a statement a caller happens to pair it with
         (see :data:`META_UPDATED_AT`).
         """
 
@@ -1737,14 +1739,29 @@ class MemoriesExtension(Extension, ABC):
         mentioned_at,
         entity_ids: list[str] | None,
         entity_names: list[str] | None = None,
+        embedding=None,
+        current_fact_type: str | None = None,
     ) -> None:
         """Apply a curation field edit to a live memory.
 
         Writes the new text / context / fact_type / occurred window, resets the
         consolidation markers (the memory re-consolidates) and stamps the edit
-        time, and drops the memory's derived links (they are recomputed). The
-        embedding is *not* written here — the caller re-embeds from the new fields
-        and calls :meth:`set_memory_embedding` after.
+        time, and drops the memory's derived links (they are recomputed).
+
+        ``embedding`` is the vector the caller re-embedded from the new fields, and
+        writing it is **part of applying the edit** — an implementation writes it
+        alongside the fields above rather than leaving it for a following
+        :meth:`set_memory_embedding`. Where a write is a durable append rather than
+        a row update, a separate call is a second write of the row this one just
+        wrote and doubles what an edit costs. ``None`` leaves the stored vector
+        alone. (:meth:`set_memory_embedding` remains for the paths that write a
+        vector without editing fields, such as restoring an invalidated memory.)
+
+        ``current_fact_type`` is the memory's fact_type BEFORE this edit, which the
+        caller has just read under this transaction. A fact-type change is the one
+        part of an edit that some stores cannot apply as a partial update, and
+        discovering it here would cost a read the caller has already paid for. It
+        may be ``None``, from a caller that does not have it.
 
         The new entity set for the memory is supplied one of two ways, and a store
         uses whichever fits how it keeps its registry:

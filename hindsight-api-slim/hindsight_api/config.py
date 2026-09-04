@@ -154,6 +154,8 @@ ENV_LLM_MAX_RETRIES = "HINDSIGHT_API_LLM_MAX_RETRIES"
 ENV_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_LLM_INITIAL_BACKOFF"
 ENV_LLM_MAX_BACKOFF = "HINDSIGHT_API_LLM_MAX_BACKOFF"
 ENV_LLM_TIMEOUT = "HINDSIGHT_API_LLM_TIMEOUT"
+ENV_LLM_CONNECT_TIMEOUT = "HINDSIGHT_API_LLM_CONNECT_TIMEOUT"
+ENV_LLM_HTTP_LOG_LEVEL = "HINDSIGHT_API_LLM_HTTP_LOG_LEVEL"
 ENV_LLM_REASONING_EFFORT = "HINDSIGHT_API_LLM_REASONING_EFFORT"
 ENV_LLM_GROQ_SERVICE_TIER = "HINDSIGHT_API_LLM_GROQ_SERVICE_TIER"
 ENV_LLM_OPENAI_SERVICE_TIER = "HINDSIGHT_API_LLM_OPENAI_SERVICE_TIER"
@@ -399,6 +401,8 @@ ENV_EMBEDDINGS_ONNX_NORMALIZE = "HINDSIGHT_API_EMBEDDINGS_ONNX_NORMALIZE"
 ENV_EMBEDDINGS_ONNX_QUERY_PREFIX = "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX"
 ENV_EMBEDDINGS_ONNX_PASSAGE_PREFIX = "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX"
 ENV_EMBEDDINGS_ONNX_OUTPUT_NAME = "HINDSIGHT_API_EMBEDDINGS_ONNX_OUTPUT_NAME"
+ENV_EMBEDDINGS_ONNX_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_ONNX_BATCH_SIZE"
+ENV_EMBEDDINGS_ONNX_CPU_MEM_ARENA = "HINDSIGHT_API_EMBEDDINGS_ONNX_CPU_MEM_ARENA"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
 ENV_EMBEDDINGS_TEI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_TEI_BATCH_SIZE"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
@@ -406,6 +410,10 @@ ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
 ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE"
 ENV_EMBEDDINGS_OPENAI_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"
+
+# How many embedding requests a remote provider keeps in flight for one encode()
+# call. Applies to every remote provider, not just one.
+ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS = "HINDSIGHT_API_EMBEDDINGS_MAX_CONCURRENT_REQUESTS"
 
 # Retry/backoff for remote embedding APIs. Recall embeds its query inline on the
 # request path, so a single upstream 5xx must not surface as a user-visible 500.
@@ -558,6 +566,9 @@ ENV_BASE_PATH = "HINDSIGHT_API_BASE_PATH"
 ENV_LOG_LEVEL = "HINDSIGHT_API_LOG_LEVEL"
 ENV_LOG_FORMAT = "HINDSIGHT_API_LOG_FORMAT"
 ENV_LOG_JSON_FIELDS = "HINDSIGHT_API_LOG_JSON_FIELDS"
+# Event loops per process. >1 only pays off on a free-threaded build, where the loops
+# execute Python in parallel rather than taking turns; see hindsight_api/multi_loop.py.
+ENV_EVENT_LOOPS = "HINDSIGHT_API_EVENT_LOOPS"
 ENV_WORKERS = "HINDSIGHT_API_WORKERS"
 ENV_ACCESS_LOG = "HINDSIGHT_API_ACCESS_LOG"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
@@ -601,6 +612,11 @@ ENV_LOOP_WATCHDOG_ENABLED = "HINDSIGHT_API_LOOP_WATCHDOG_ENABLED"
 ENV_LOOP_WATCHDOG_STALL_THRESHOLD_MS = "HINDSIGHT_API_LOOP_WATCHDOG_STALL_THRESHOLD_MS"
 ENV_LOOP_WATCHDOG_POLL_INTERVAL_MS = "HINDSIGHT_API_LOOP_WATCHDOG_POLL_INTERVAL_MS"
 ENV_DB_ACQUIRE_WARN_THRESHOLD_MS = "HINDSIGHT_API_DB_ACQUIRE_WARN_THRESHOLD_MS"
+
+# Codex (ChatGPT OAuth) credentials directory. Overrides the process-wide
+# CODEX_HOME for the primary LLM; indexed members set their own
+# (HINDSIGHT_API_<OP>LLM_<n>_CODEX_HOME) so a chain can span two profiles.
+ENV_LLM_CODEX_HOME = "HINDSIGHT_API_LLM_CODEX_HOME"
 
 # Vertex AI configuration
 ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
@@ -728,6 +744,11 @@ ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
 
 # Database migrations
 ENV_RUN_MIGRATIONS_ON_STARTUP = "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP"
+# Whether migrations run in a subprocess instead of in the calling process.
+# "auto" (default) isolates only on a free-threaded interpreter, where alembic's
+# psycopg2 would otherwise re-enable the GIL for the life of the process; "true"
+# and "false" force it either way. See migrations._should_isolate_migrations.
+ENV_MIGRATION_ISOLATION = "HINDSIGHT_API_MIGRATION_ISOLATION"
 ENV_MIGRATION_CONCURRENCY = "HINDSIGHT_API_MIGRATION_CONCURRENCY"
 
 # Database connection pool
@@ -991,7 +1012,36 @@ DEFAULT_LLM_MAX_RETRIES = 3  # Max retry attempts for LLM API calls
 DEFAULT_LLM_INITIAL_BACKOFF = 1.0  # Initial backoff in seconds for retry exponential backoff
 DEFAULT_LLM_MAX_BACKOFF = 60.0  # Max backoff cap in seconds for retry exponential backoff
 DEFAULT_LLM_TIMEOUT = 120.0  # seconds
+# Connect-phase ceiling, capped separately from the total request timeout. The SDKs take a
+# bare float as "all four httpx phases", so passing llm_timeout alone silently raises the
+# connect timeout from the OpenAI SDK's own 5 s default to the full request budget: an
+# endpoint that never completes the TCP/TLS handshake then burns the whole llm_timeout
+# instead of failing in seconds (issue #3881). Effective value is min(this, llm_timeout).
+DEFAULT_LLM_CONNECT_TIMEOUT = 10.0  # seconds
+# Level for the `httpx` and `httpcore` loggers. Default WARNING keeps per-request noise out
+# of normal operation; DEBUG makes httpcore name the exact phase a stalled request is stuck
+# in (connect_tcp / send_request_headers / receive_response_headers), which is the one
+# instrument that tells a hung LLM call apart from a slow one (issue #3881).
+DEFAULT_LLM_HTTP_LOG_LEVEL = "WARNING"
+# Reflect's own per-request deadline, applied when neither HINDSIGHT_API_REFLECT_LLM_TIMEOUT
+# nor an explicit HINDSIGHT_API_LLM_TIMEOUT is set. Deliberately below DEFAULT_LLM_TIMEOUT:
+# reflect is the one interactive operation — a caller is holding an HTTP request open — and
+# it makes several sequential LLM calls, so a per-call deadline equal to the whole global
+# budget lets ONE stalled call outlive the caller. Retain and consolidation run in the
+# background against a queue and keep the 120s, where the deadline is there to stop runaway
+# generation rather than to keep a request responsive.
+#
+# 30s is chosen against the *retry ladder*, not against a single call: a stalled attempt is
+# retried (see _TIMEOUT_RETRIES in providers/gemini_llm.py), so what has to fit inside a
+# caller's patience is deadline x attempts, and 30x3 = 90s does. A first pass at 60s did not:
+# CI logs showed reflect calls answering in 1-4s but stalling on roughly a quarter of
+# attempts, so two stalls in a row landed right back on 120s. The headroom over a healthy
+# call is still an order of magnitude.
+DEFAULT_REFLECT_LLM_TIMEOUT = 30.0  # seconds
 DEFAULT_LLM_SEND_BANK_AS_USER = False  # Opt-in: tag provider calls with user=<bank_id>
+
+# Codex credentials directory (None = CODEX_HOME, else ~/.codex)
+DEFAULT_LLM_CODEX_HOME = None
 
 # Vertex AI defaults
 DEFAULT_LLM_VERTEXAI_PROJECT_ID = None  # Required for Vertex AI
@@ -1019,12 +1069,30 @@ DEFAULT_EMBEDDINGS_QUERY_PREFIX = ""
 DEFAULT_EMBEDDINGS_PASSAGE_PREFIX = ""
 DEFAULT_EMBEDDINGS_ONNX_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDINGS_ONNX_PASSAGE_PREFIX = "passage: "
+# Texts per ONNX forward pass. The provider runs in-process, so this is the only thing
+# bounding the activation tensor a caller can trigger; 32 matches TEI and the reranker.
+DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE = 32
+DEFAULT_EMBEDDINGS_ONNX_CPU_MEM_ARENA = False  # Disable ONNX CPU memory arena to bound RSS
 DEFAULT_EMBEDDINGS_OPENAI_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE = 100
-# Texts per TEI /embed request. Also the batch size the streaming retain producer
-# coalesces its per-chunk embedding calls up to (see embedding_coalescer), so raising
-# it is how a TEI deployment with headroom trades requests for larger ones.
+# Texts per TEI /embed request, and the unit the client fans out over (see
+# DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS). 32 is also TEI's own default
+# --max-client-batch-size, and that is a hard validation error rather than a soft cap, so
+# raising this above the server's value fails the request instead of being clamped.
+#
+# A sweep on bge-small/L4 at ~430-token inputs put batch 8 at 8 in-flight requests
+# slightly ahead of batch 32 (2,080 vs 1,904 texts/s, and 30ms p50 against 140ms), and
+# #4039 proposed lowering the default on that basis. Left at 32: a ~9% edge measured on
+# one model, one accelerator and one input length is too thin to change the request
+# profile of every existing TEI deployment, and the concurrency knob below is where the
+# throughput actually came from. Lower it per-deployment if a sweep on your own hardware
+# says so.
 DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE = 32
+# Embedding requests a remote provider issues concurrently for one encode() call. This
+# is what actually buys embedder throughput: the same TEI server measured 903 texts/s at
+# one in-flight request and 2,080 at eight. Bounded here rather than at the caller
+# because the right value is a property of the embedding service.
+DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS = 8
 # Embedding retry defaults: 4 retries (5 attempts total) with 0.5s -> 4s exponential
 # backoff, plus a 15s ceiling on the time any single encode() call may spend retrying
 # so a synchronous recall degrades to a slow response instead of a long stall.
@@ -1256,6 +1324,7 @@ DEFAULT_PORT = 8888
 DEFAULT_BASE_PATH = ""  # Empty string = root path
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_LOG_FORMAT = "text"  # Options: "text", "json"
+DEFAULT_EVENT_LOOPS = 1
 DEFAULT_WORKERS = 1
 DEFAULT_ACCESS_LOG = False
 DEFAULT_MCP_ENABLED = True
@@ -1407,6 +1476,12 @@ DEFAULT_OBSERVATION_SCOPE_LIMITS: list | None = None
 
 # Database migrations
 DEFAULT_RUN_MIGRATIONS_ON_STARTUP = True
+# "auto" | "true" | "false" — see ENV_MIGRATION_ISOLATION. Spelled as a tri-state
+# boolean rather than always/never so it reads like every other on/off flag here:
+# the question the value answers is "isolate the migration?", and "auto" is the
+# third answer, "let the interpreter decide".
+DEFAULT_MIGRATION_ISOLATION = "auto"
+MIGRATION_ISOLATION_CHOICES = ("auto", "true", "false")
 # Number of tenant schemas to migrate concurrently. Each schema runs in its own
 # process (Alembic's command.upgrade() is not thread-safe); within a schema the
 # work is always sequential. 1 = fully sequential (the safe default).
@@ -1960,6 +2035,29 @@ def _get_default_model_for_provider(provider: str) -> str:
     return PROVIDER_DEFAULT_MODELS.get(provider.lower(), DEFAULT_LLM_MODEL)
 
 
+def _resolve_reflect_llm_timeout() -> float | None:
+    """Reflect's per-request LLM deadline, or ``None`` to inherit ``llm_timeout``.
+
+    Three cases, in order:
+
+    * ``HINDSIGHT_API_REFLECT_LLM_TIMEOUT`` set — the operator said what reflect gets.
+    * ``HINDSIGHT_API_LLM_TIMEOUT`` set — the operator chose a global deadline
+      deliberately, so reflect inherits it rather than being quietly capped below it.
+    * neither — ``DEFAULT_REFLECT_LLM_TIMEOUT``, which is shorter than the global
+      default because reflect answers a waiting caller (see that constant).
+
+    The middle case is why this is not simply a different default on the field: the
+    per-operation overrides mean "inherit unless set", and silently ignoring an
+    explicit global would be the more surprising behaviour of the two.
+    """
+    explicit = os.getenv(ENV_REFLECT_LLM_TIMEOUT)
+    if explicit:
+        return float(explicit)
+    if os.getenv(ENV_LLM_TIMEOUT):
+        return None
+    return DEFAULT_REFLECT_LLM_TIMEOUT
+
+
 def _parse_llm_router_config(env_var: str) -> dict | None:
     """
     Parse a LiteLLM Router configuration from a JSON env var.
@@ -1997,6 +2095,7 @@ class LLMMemberConfig:
     bedrock_service_tier: str | None
     gemini_service_tier: str | None
     cache_affinity: str | None = None
+    codex_home: str | None = None
     vertexai_project_id: str | None = None
     vertexai_region: str | None = None
     vertexai_service_account_key: str | None = None
@@ -2095,6 +2194,7 @@ def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
                 gemini_service_tier=(
                     parse_gemini_service_tier(gemini_service_tier) if provider.lower() == "gemini" else None
                 ),
+                codex_home=os.getenv(base + "CODEX_HOME") or None,
                 vertexai_project_id=os.getenv(base + "VERTEXAI_PROJECT_ID") or None,
                 vertexai_region=os.getenv(base + "VERTEXAI_REGION") or None,
                 vertexai_service_account_key=os.getenv(base + "VERTEXAI_SERVICE_ACCOUNT_KEY") or None,
@@ -2394,6 +2494,8 @@ class HindsightConfig:
     llm_initial_backoff: float
     llm_max_backoff: float
     llm_timeout: float
+    llm_connect_timeout: float
+    llm_http_log_level: str
     # None when unset, and unset means no provider sends a reasoning parameter at all —
     # each model runs at its own default effort. A configured value is a statement about
     # the deployment and is sent as given (issue #3449).
@@ -2455,6 +2557,12 @@ class HindsightConfig:
     # Each entry: {"provider": str, "model": str, "api_key": str | None, "base_url": str | None}.
     # Treated as a credential field because entries embed api keys.
     llm_litellmrouter_config: dict | None
+
+    # Codex credentials directory for the primary LLM. Server-level only (not
+    # bank-configurable): it is a filesystem path to a credential store, so
+    # accepting it over the config API would let a bank point the server at an
+    # arbitrary file.
+    llm_codex_home: str | None
 
     # Vertex AI configuration
     llm_vertexai_project_id: str | None
@@ -2547,6 +2655,8 @@ class HindsightConfig:
     embeddings_onnx_query_prefix: str
     embeddings_onnx_passage_prefix: str
     embeddings_onnx_output_name: str | None
+    embeddings_onnx_batch_size: int
+    embeddings_onnx_cpu_mem_arena: bool
     embeddings_tei_url: str | None
     embeddings_openai_base_url: str | None
     embeddings_cohere_api_key: str | None
@@ -2793,6 +2903,7 @@ class HindsightConfig:
 
     # Database migrations
     run_migrations_on_startup: bool
+    migration_isolation: str
     migration_concurrency: int
 
     # Database connection pool
@@ -2892,6 +3003,7 @@ class HindsightConfig:
     # Keep at the end of the dataclass; Python forbids non-default fields after default fields.
     embeddings_openai_batch_size: int = DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE
     embeddings_tei_batch_size: int = DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE
+    embeddings_max_concurrent_requests: int = DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS
     embeddings_openai_dimensions: int | None = None
     embeddings_query_prefix: str = DEFAULT_EMBEDDINGS_QUERY_PREFIX
     embeddings_passage_prefix: str = DEFAULT_EMBEDDINGS_PASSAGE_PREFIX
@@ -3443,6 +3555,8 @@ class HindsightConfig:
             llm_initial_backoff=float(os.getenv(ENV_LLM_INITIAL_BACKOFF, str(DEFAULT_LLM_INITIAL_BACKOFF))),
             llm_max_backoff=float(os.getenv(ENV_LLM_MAX_BACKOFF, str(DEFAULT_LLM_MAX_BACKOFF))),
             llm_timeout=float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT))),
+            llm_connect_timeout=float(os.getenv(ENV_LLM_CONNECT_TIMEOUT, str(DEFAULT_LLM_CONNECT_TIMEOUT))),
+            llm_http_log_level=os.getenv(ENV_LLM_HTTP_LOG_LEVEL, DEFAULT_LLM_HTTP_LOG_LEVEL),
             llm_reasoning_effort=os.getenv(ENV_LLM_REASONING_EFFORT) or None,
             llm_groq_service_tier=os.getenv(ENV_LLM_GROQ_SERVICE_TIER, DEFAULT_LLM_GROQ_SERVICE_TIER),
             llm_openai_service_tier=os.getenv(ENV_LLM_OPENAI_SERVICE_TIER, DEFAULT_LLM_OPENAI_SERVICE_TIER),
@@ -3490,6 +3604,8 @@ class HindsightConfig:
                 ENV_LLM_TEMPERATURE_CONSOLIDATION, DEFAULT_LLM_TEMPERATURE_CONSOLIDATION
             ),
             llm_litellmrouter_config=_parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG),
+            # Codex (ChatGPT OAuth) credentials directory
+            llm_codex_home=os.getenv(ENV_LLM_CODEX_HOME) or DEFAULT_LLM_CODEX_HOME,
             # Vertex AI
             llm_vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or DEFAULT_LLM_VERTEXAI_PROJECT_ID,
             llm_vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION, DEFAULT_LLM_VERTEXAI_REGION),
@@ -3564,9 +3680,7 @@ class HindsightConfig:
             reflect_llm_max_backoff=float(os.getenv(ENV_REFLECT_LLM_MAX_BACKOFF))
             if os.getenv(ENV_REFLECT_LLM_MAX_BACKOFF)
             else None,
-            reflect_llm_timeout=float(os.getenv(ENV_REFLECT_LLM_TIMEOUT))
-            if os.getenv(ENV_REFLECT_LLM_TIMEOUT)
-            else None,
+            reflect_llm_timeout=_resolve_reflect_llm_timeout(),
             reflect_llm_litellmrouter_config=_parse_llm_router_config(ENV_REFLECT_LLM_LITELLMROUTER_CONFIG),
             reflect_llm_reasoning_effort=os.getenv(ENV_REFLECT_LLM_REASONING_EFFORT) or None,
             reflect_llm_extra_body=json.loads(os.getenv(ENV_REFLECT_LLM_EXTRA_BODY, "null")),
@@ -3660,6 +3774,15 @@ class HindsightConfig:
                 ENV_EMBEDDINGS_ONNX_PASSAGE_PREFIX, DEFAULT_EMBEDDINGS_ONNX_PASSAGE_PREFIX
             ),
             embeddings_onnx_output_name=os.getenv(ENV_EMBEDDINGS_ONNX_OUTPUT_NAME) or None,
+            embeddings_onnx_batch_size=_parse_positive_int(
+                ENV_EMBEDDINGS_ONNX_BATCH_SIZE,
+                os.getenv(ENV_EMBEDDINGS_ONNX_BATCH_SIZE),
+                DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE,
+            ),
+            embeddings_onnx_cpu_mem_arena=os.getenv(
+                ENV_EMBEDDINGS_ONNX_CPU_MEM_ARENA, str(DEFAULT_EMBEDDINGS_ONNX_CPU_MEM_ARENA)
+            ).lower()
+            == "true",
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
             embeddings_openai_batch_size=_parse_positive_int(
@@ -3671,6 +3794,11 @@ class HindsightConfig:
                 ENV_EMBEDDINGS_TEI_BATCH_SIZE,
                 os.getenv(ENV_EMBEDDINGS_TEI_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE,
+            ),
+            embeddings_max_concurrent_requests=_parse_positive_int(
+                ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS,
+                os.getenv(ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS),
+                DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS,
             ),
             embeddings_openai_dimensions=_parse_optional_positive_int(
                 ENV_EMBEDDINGS_OPENAI_DIMENSIONS,
@@ -4171,6 +4299,7 @@ class HindsightConfig:
             memory_defense=None,
             # Database migrations
             run_migrations_on_startup=os.getenv(ENV_RUN_MIGRATIONS_ON_STARTUP, "true").lower() == "true",
+            migration_isolation=_parse_migration_isolation(),
             migration_concurrency=int(os.getenv(ENV_MIGRATION_CONCURRENCY, str(DEFAULT_MIGRATION_CONCURRENCY))),
             # Database connection pool
             db_pool_min_size=int(os.getenv(ENV_DB_POOL_MIN_SIZE, str(DEFAULT_DB_POOL_MIN_SIZE))),
@@ -4492,6 +4621,21 @@ class HindsightConfig:
 
 # Cached config instance
 _config_cache: HindsightConfig | None = None
+
+
+def _parse_migration_isolation() -> str:
+    """Validate HINDSIGHT_API_MIGRATION_ISOLATION, defaulting to "auto".
+
+    Rejects an unknown value rather than silently falling back: getting this wrong
+    means migrations quietly run in the wrong process, which is invisible until
+    something else breaks.
+    """
+    raw = os.getenv(ENV_MIGRATION_ISOLATION, DEFAULT_MIGRATION_ISOLATION).strip().lower()
+    if raw not in MIGRATION_ISOLATION_CHOICES:
+        raise ValueError(
+            f"{ENV_MIGRATION_ISOLATION} must be one of {', '.join(MIGRATION_ISOLATION_CHOICES)}, got {raw!r}"
+        )
+    return raw
 
 
 def get_config() -> StaticConfigProxy:

@@ -2,7 +2,6 @@
 LLM wrapper for unified configuration across providers.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -14,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 from json_repair import repair_json
 from pydantic import BaseModel
+
+from .._cross_loop import CrossLoopSemaphore
 
 # Vertex AI imports (conditional - for LLMProvider to pass credentials to GeminiLLM)
 try:
@@ -40,22 +41,30 @@ from .llm_interface import (
 from .llm_interface import (
     OutputTooLongError as OutputTooLongError,
 )
+from .llm_transport import configure_http_logging
 
 if TYPE_CHECKING:
     from .response_models import LLMToolCallResult
 
 logger = logging.getLogger(__name__)
 
-# Disable httpx logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# httpx/httpcore log levels (WARNING by default; raise to DEBUG to see which phase a
+# stalled request is stuck in -- see llm_transport.py).
+configure_http_logging()
 
 # Global semaphore to limit concurrent LLM requests across all instances.
 # Set HINDSIGHT_API_LLM_MAX_CONCURRENT=1 for local LLMs (LM Studio, Ollama).
+#
+# CrossLoopSemaphore, not asyncio.Semaphore: this is module-level state shared by
+# every event loop in the process, and an asyncio.Semaphore binds to whichever loop
+# first waits on it — so with several loops (free-threaded uvicorn) the first
+# contended LLM call claims it and every other loop then fails. The cap stays
+# process-wide, which is what --workers N already implied.
 _llm_max_concurrent = int(os.getenv(ENV_LLM_MAX_CONCURRENT, str(DEFAULT_LLM_MAX_CONCURRENT)))
-_global_llm_semaphore = asyncio.Semaphore(_llm_max_concurrent)
+_global_llm_semaphore = CrossLoopSemaphore(_llm_max_concurrent)
 
 
-def _build_per_op_semaphores() -> dict[str, asyncio.Semaphore]:
+def _build_per_op_semaphores() -> dict[str, CrossLoopSemaphore]:
     """Build the per-operation semaphore registry from env vars.
 
     Each per-op cap is composed with — not a substitute for — the global cap:
@@ -67,7 +76,7 @@ def _build_per_op_semaphores() -> dict[str, asyncio.Semaphore]:
     Operations without a configured env var are absent from the registry and
     therefore only constrained by the global cap.
     """
-    semaphores: dict[str, asyncio.Semaphore] = {}
+    semaphores: dict[str, CrossLoopSemaphore] = {}
     for op, env_var in (
         ("retain", ENV_RETAIN_LLM_MAX_CONCURRENT),
         ("reflect", ENV_REFLECT_LLM_MAX_CONCURRENT),
@@ -79,11 +88,11 @@ def _build_per_op_semaphores() -> dict[str, asyncio.Semaphore]:
         value = int(raw)
         if value <= 0:
             raise ValueError(f"{env_var} must be a positive integer, got {raw!r}")
-        semaphores[op] = asyncio.Semaphore(value)
+        semaphores[op] = CrossLoopSemaphore(value)
     return semaphores
 
 
-_per_op_llm_semaphores: dict[str, asyncio.Semaphore] = _build_per_op_semaphores()
+_per_op_llm_semaphores: dict[str, CrossLoopSemaphore] = _build_per_op_semaphores()
 
 
 def _scope_to_operation(scope: str) -> str | None:
@@ -102,7 +111,7 @@ def _scope_to_operation(scope: str) -> str | None:
     return None
 
 
-def _semaphores_for_scope(scope: str) -> list[asyncio.Semaphore]:
+def _semaphores_for_scope(scope: str) -> list[CrossLoopSemaphore]:
     """Return the semaphores a call with the given scope must acquire.
 
     Always includes the global semaphore; includes the per-op semaphore when
@@ -117,14 +126,28 @@ def _semaphores_for_scope(scope: str) -> list[asyncio.Semaphore]:
     return [per_op, _global_llm_semaphore]
 
 
+async def _acquire_permits(stack: AsyncExitStack, scope: str) -> None:
+    """Enter the scope's concurrency permits on ``stack``, timing the wait.
+
+    The wait is reported to the caller's queue-wait sink (when one is bound) so a
+    slow LLM call can be attributed to queueing rather than to the provider --
+    the two are otherwise indistinguishable in the reported duration (#3881).
+    """
+    from .llm_trace import record_queue_wait
+
+    queue_start = time.monotonic()
+    for sem in _semaphores_for_scope(scope):
+        await stack.enter_async_context(sem)
+    record_queue_wait(time.monotonic() - queue_start)
+
+
 @asynccontextmanager
 async def _attempt_permits(scope: str):
     """Hold configured LLM concurrency permits for one upstream attempt."""
     from ..worker.stage import get_stage, set_stage
 
     async with AsyncExitStack() as stack:
-        for sem in _semaphores_for_scope(scope):
-            await stack.enter_async_context(sem)
+        await _acquire_permits(stack, scope)
         try:
             yield
         except BaseException:
@@ -439,6 +462,11 @@ def create_llm_provider(
     ollama_num_ctx: int | None = None,
     cache_affinity: str | None = None,
     structured_output_forced_tool: bool = False,
+    # Appended rather than inserted: some callers still pass the older settings
+    # positionally (guarded by the positional-compatibility tests in
+    # tests/test_llm_wrapper.py), so a parameter added mid-list silently steals
+    # another one's slot. New parameters go at the end.
+    codex_home: str | None = None,
 ) -> Any:  # Returns LLMInterface
     """
     Factory function to create the appropriate LLM provider implementation.
@@ -487,6 +515,8 @@ def create_llm_provider(
             Nous). ``None`` lets each provider fall back to its own default
             (``HINDSIGHT_API_LLM_TIMEOUT`` / ``DEFAULT_LLM_TIMEOUT`` for those four;
             Anthropic and Gemini keep their provider-specific defaults).
+        codex_home: Codex credentials directory (for the openai-codex provider); overrides
+            the process-wide ``CODEX_HOME``.
 
     Returns:
         LLMInterface implementation for the specified provider.
@@ -525,6 +555,8 @@ def create_llm_provider(
             model=model,
             reasoning_effort=reasoning_effort,
             extra_body=extra_body,
+            codex_home=codex_home,
+            timeout=timeout,
         )
 
     elif provider_lower == "claude-code":
@@ -571,6 +603,7 @@ def create_llm_provider(
             base_url=base_url,
             model=model,
             reasoning_effort=reasoning_effort,
+            timeout=timeout,
             vertexai_project_id=vertexai_project_id,
             vertexai_region=vertexai_region,
             vertexai_credentials=vertexai_credentials,
@@ -589,6 +622,7 @@ def create_llm_provider(
             reasoning_effort=reasoning_effort,
             default_headers=default_headers,
             extra_body=extra_body,
+            timeout=timeout,
         )
 
     elif provider_lower == "litellm":
@@ -652,6 +686,7 @@ def create_llm_provider(
             model=model,
             reasoning_effort=reasoning_effort,
             extra_body=extra_body,
+            timeout=timeout,
             model_path=config.llamacpp_model_path,
             gpu_layers=config.llamacpp_gpu_layers,
             context_size=config.llamacpp_context_size,
@@ -673,6 +708,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             cache_affinity=cache_affinity,
+            timeout=timeout,
         )
 
     elif provider_lower == "nous":
@@ -795,6 +831,10 @@ class LLMProvider:
         ollama_num_ctx: int | None = None,
         cache_affinity: str | None = None,
         structured_output_forced_tool: bool = False,
+        # Appended rather than inserted — see the note on ``create_llm_provider``:
+        # callers that pass these positionally would otherwise have one argument
+        # land in the wrong slot.
+        codex_home: str | None = None,
     ):
         """
         Initialize LLM provider.
@@ -845,6 +885,11 @@ class LLMProvider:
             structured_output_forced_tool: Structured output via a forced tool call
                 instead of ``response_format``, for the LiteLLM-backed providers - from
                 config (``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``).
+            codex_home: Codex credentials directory for ``provider="openai-codex"`` — the
+                directory holding the ``auth.json`` this provider authenticates with. ``None``
+                uses the process-wide ``CODEX_HOME`` (else ``~/.codex``). Set it per member of a
+                multi-LLM chain to run two independently authorized ChatGPT profiles, so that
+                failover away from a rate-limited profile actually reaches a different account.
 
         This constructor uses every argument as passed and does not read global
         ``HindsightConfig``: resolving the server-level default for a ``None`` argument is the
@@ -868,6 +913,9 @@ class LLMProvider:
         self.initial_backoff = initial_backoff
         self.max_backoff = max_backoff
         self.litellmrouter_config = litellmrouter_config
+        # Codex credentials directory (openai-codex only). Used verbatim — the caller
+        # resolves the server-level default, like the fields around it.
+        self.codex_home = codex_home
         # Service tiers from hierarchical config (not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = openai_service_tier
@@ -1021,6 +1069,7 @@ class LLMProvider:
             openai_service_tier=self.openai_service_tier,
             bedrock_service_tier=self.bedrock_service_tier,
             gemini_service_tier=self.gemini_service_tier,
+            codex_home=self.codex_home,
             extra_body=self.extra_body,
             default_headers=self.default_headers,
             vertexai_project_id=vertexai_project_id,
@@ -1228,8 +1277,7 @@ class LLMProvider:
             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
             async with AsyncExitStack() as stack:
                 if not attempt_gated:
-                    for sem in _semaphores_for_scope(scope):
-                        await stack.enter_async_context(sem)
+                    await _acquire_permits(stack, scope)
                     # Permits in hand — only now leave `.queued`. Attempt-gated
                     # providers acquire permits per attempt instead, so they keep
                     # `.queued` until their first `attempt=N` stamp lands after
@@ -1376,8 +1424,7 @@ class LLMProvider:
             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
             async with AsyncExitStack() as stack:
                 if not attempt_gated:
-                    for sem in _semaphores_for_scope(scope):
-                        await stack.enter_async_context(sem)
+                    await _acquire_permits(stack, scope)
                     # Permits in hand — only now leave `.queued`; attempt-gated
                     # providers stay `.queued` until their first post-acquire
                     # `attempt=N` stamp (see call() above, #3002).
@@ -1485,7 +1532,8 @@ class LLMProvider:
         """
         Load OAuth credentials from the Codex ``auth.json``.
 
-        Honors ``CODEX_HOME`` (falling back to ``~/.codex``).
+        Honors this provider's ``codex_home``, then ``CODEX_HOME`` (falling back
+        to ``~/.codex``).
 
         Returns:
             Tuple of (access_token, account_id).
@@ -1496,7 +1544,7 @@ class LLMProvider:
         """
         from .providers.codex_auth import default_codex_auth_file
 
-        auth_file = default_codex_auth_file()
+        auth_file = default_codex_auth_file(self.codex_home)
 
         if not auth_file.exists():
             raise FileNotFoundError(
@@ -1614,6 +1662,7 @@ class LLMProvider:
             ENV_LLM_BASE_URL,
             ENV_LLM_BEDROCK_SERVICE_TIER,
             ENV_LLM_CACHE_AFFINITY,
+            ENV_LLM_CODEX_HOME,
             ENV_LLM_DEFAULT_HEADERS,
             ENV_LLM_EXTRA_BODY,
             ENV_LLM_GEMINI_SAFETY_SETTINGS,
@@ -1683,6 +1732,7 @@ class LLMProvider:
             prompt_cache_enabled=prompt_cache_enabled,
             ollama_num_ctx=_parse_optional_positive_int(ENV_LLM_OLLAMA_NUM_CTX, os.getenv(ENV_LLM_OLLAMA_NUM_CTX)),
             litellmrouter_config=_parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG),
+            codex_home=os.getenv(ENV_LLM_CODEX_HOME) or None,
             vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or None,
             vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION) or None,
             vertexai_service_account_key=os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY) or None,

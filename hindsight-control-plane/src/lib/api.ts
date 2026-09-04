@@ -186,8 +186,10 @@ export interface OperationProgress {
 
 export type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 
+export type TagResolution = "exact" | "fuzzy";
+
 export type TagGroup =
-  | { tags: string[]; match?: TagsMatch }
+  | { tags: string[]; match?: TagsMatch; resolve?: TagResolution }
   | { and: TagGroup[] }
   | { or: TagGroup[] }
   | { not: TagGroup };
@@ -239,6 +241,18 @@ export type RefreshOutcome =
   | "content_preserved_no_new_facts"
   | "refresh_failed_empty_candidate"
   | "refresh_failed_delta_not_applied";
+
+/** Why a refresh refused to write, as recorded on the model's own history. */
+export type RefreshFailureReason =
+  | "empty_candidate"
+  | "structured_doc_unreadable"
+  | "delta_ops_failed"
+  | "delta_ops_all_skipped"
+  | "delta_not_applied"
+  | "structured_output_failed"
+  | "retrieval_failed"
+  | "no_answer"
+  | "unexpected_error";
 
 export interface MentalModelRefreshScope {
   tags?: string[] | null;
@@ -479,6 +493,7 @@ export class ControlPlaneClient {
     query_timestamp?: string;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    tag_groups?: TagGroup[];
     min_scores?: {
       semantic?: number | null;
       keyword?: number | null;
@@ -506,6 +521,7 @@ export class ControlPlaneClient {
     include_tool_calls?: boolean;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    tag_groups?: TagGroup[];
     apply_all_directives?: boolean;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
@@ -1727,6 +1743,12 @@ export class ControlPlaneClient {
           mental_models?: unknown[];
         } | null;
         changed_at: string;
+        /** Present only on failure records: a refresh that refused to write.
+         *  Absent (undefined) on the version snapshots a successful refresh
+         *  writes, which is every row written before failures were recorded. */
+        kind?: "refresh_failed";
+        failure_reason?: RefreshFailureReason;
+        error_message?: string;
       }[]
     >(bankApi(bankId, `/mental-models/${encodeURIComponent(mentalModelId)}/history`));
   }
