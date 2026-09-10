@@ -41,7 +41,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext, suppress
 from dataclasses import dataclass
@@ -51,7 +50,12 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, Field
 
-from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
+from hindsight_api.config import (
+    DEFAULT_XAI_OAUTH_BASE_URL,
+    ENV_XAI_OAUTH_BASE_URL,
+    ENV_XAI_OAUTH_DEBUG_HEADERS,
+    get_config,
+)
 from hindsight_api.engine.cache_affinity import XAI_CONV_ID_HEADER, cache_affinity_id
 from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice, LLMToolChoiceMode
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
@@ -69,6 +73,8 @@ from hindsight_api.engine.structured_output import provider_json_schema, strict_
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
+from ..response_models import LLMCallResult
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -84,9 +90,9 @@ __all__ = [
 #: ``HINDSIGHT_API_LLM_BASE_URL`` that deployments often set for an unrelated
 #: proxy — the same "more specific beats more general" rule the rest of
 #: Hindsight's config hierarchy follows.
-ENV_BASE_URL = "HINDSIGHT_API_XAI_OAUTH_BASE_URL"
 
-DEFAULT_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_BASE_URL = DEFAULT_XAI_OAUTH_BASE_URL
+ENV_BASE_URL = ENV_XAI_OAUTH_BASE_URL
 
 #: Body marker xAI returns when the account's spending limit stopped the call.
 SPENDING_LIMIT_CODE = "personal-team-blocked:spending-limit"
@@ -103,7 +109,8 @@ MAX_ERROR_DETAIL_CHARS = 200
 
 #: Debug-only response-header logging on a non-2xx reply (default off). See
 #: the module docstring's Logging section for the exact carve-out.
-ENV_DEBUG_HEADERS = "HINDSIGHT_API_XAI_OAUTH_DEBUG_HEADERS"
+ENV_DEBUG_HEADERS = ENV_XAI_OAUTH_DEBUG_HEADERS
+
 
 #: Response headers safe to log verbatim under ``ENV_DEBUG_HEADERS``: routing
 #: and diagnostic metadata that names no credential and carries no request
@@ -334,7 +341,7 @@ def _actual_host(base_url: str) -> str:
 
 
 def _debug_headers_enabled() -> bool:
-    return os.getenv(ENV_DEBUG_HEADERS, "false").lower() == "true"
+    return get_config().xai_oauth_debug_headers
 
 
 def _log_non_2xx_response_headers(response: httpx.Response) -> None:
@@ -376,11 +383,13 @@ class XaiOAuthLLM(LLMInterface):
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
-        self.base_url = (os.environ.get(ENV_BASE_URL, "").strip() or self.base_url or DEFAULT_BASE_URL).rstrip("/")
+        # None means the operator named no deployment-wide endpoint, so the caller's
+        # base_url still gets its turn ahead of the vendor default.
+        self.base_url = (get_config().xai_oauth_base_url or self.base_url or DEFAULT_BASE_URL).rstrip("/")
 
         # Honour the engine-resolved per-operation timeout; fall back to the
         # same global default the OpenAI-compatible providers use.
-        self.timeout = timeout if timeout is not None else float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
+        self.timeout = timeout if timeout is not None else get_config().llm_timeout
 
         self._auth = auth_manager or XaiOAuthManager()
         self._auth_lock = asyncio.Lock()
@@ -657,6 +666,10 @@ class XaiOAuthLLM(LLMInterface):
     # LLMInterface
     # ------------------------------------------------------------------
 
+    def supports_vision(self) -> bool:
+        """Grok models are multimodal."""
+        return True
+
     async def verify_connection(self) -> None:
         """Verify the lane with one tiny completion."""
         try:
@@ -700,9 +713,8 @@ class XaiOAuthLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> Any:
+    ) -> LLMCallResult:
         """Make a non-streaming completion call with retry logic.
 
         Non-streaming is deliberate for the first implementation: the engine
@@ -784,15 +796,16 @@ class XaiOAuthLLM(LLMInterface):
                     finish_reason=completion_content.finish_reason,
                 )
 
-                if return_usage:
-                    return result, TokenUsage(
+                return LLMCallResult(
+                    content=result,
+                    usage=TokenUsage(
                         input_tokens=counts.input_tokens,
                         output_tokens=counts.output_tokens,
                         total_tokens=counts.total_tokens,
                         cached_tokens=counts.cached_tokens,
                         thoughts_tokens=counts.thoughts_tokens,
-                    )
-                return result
+                    ),
+                )
 
             # XaiOAuthRefreshError is retried alongside the transport errors: a
             # credential-side blip (a network error reaching auth.x.ai, a 5xx

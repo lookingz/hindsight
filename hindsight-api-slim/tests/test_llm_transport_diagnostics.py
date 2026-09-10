@@ -12,6 +12,7 @@ cover the three pieces that make that distinction visible:
   the request was actually in flight.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import asyncio
 import logging
 from unittest.mock import patch
@@ -19,7 +20,12 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from hindsight_api.config import DEFAULT_LLM_CONNECT_TIMEOUT, ENV_LLM_CONNECT_TIMEOUT, ENV_LLM_HTTP_LOG_LEVEL
+from hindsight_api.config import (
+    DEFAULT_LLM_CONNECT_TIMEOUT,
+    ENV_LLM_CONNECT_TIMEOUT,
+    ENV_LLM_HTTP_LOG_LEVEL,
+    clear_config_cache,
+)
 from hindsight_api.engine.llm_trace import (
     LLMQueueWait,
     record_queue_wait,
@@ -211,14 +217,21 @@ def test_describe_llm_error_omits_the_bracket_without_a_cause():
 
 
 def test_http_logging_level_is_configurable(monkeypatch):
-    """httpcore at DEBUG is the instrument that names the stalled phase."""
+    """httpcore at DEBUG is the instrument that names the stalled phase.
+
+    The explicit cache clears are because this test changes the environment twice:
+    the conftest reset only covers the state the test starts from, and the level is
+    read off the config, not the environment.
+    """
     monkeypatch.setenv(ENV_LLM_HTTP_LOG_LEVEL, "DEBUG")
+    clear_config_cache()
     try:
         configure_http_logging()
         assert logging.getLogger("httpx").level == logging.DEBUG
         assert logging.getLogger("httpcore").level == logging.DEBUG
     finally:
         monkeypatch.delenv(ENV_LLM_HTTP_LOG_LEVEL, raising=False)
+        clear_config_cache()
         configure_http_logging()
 
     assert logging.getLogger("httpx").level == logging.WARNING
@@ -227,11 +240,13 @@ def test_http_logging_level_is_configurable(monkeypatch):
 
 def test_unparseable_http_log_level_falls_back(monkeypatch):
     monkeypatch.setenv(ENV_LLM_HTTP_LOG_LEVEL, "chatty")
+    clear_config_cache()
     try:
         configure_http_logging()
         assert logging.getLogger("httpx").level == logging.WARNING
     finally:
         monkeypatch.delenv(ENV_LLM_HTTP_LOG_LEVEL, raising=False)
+        clear_config_cache()
         configure_http_logging()
 
 
@@ -279,7 +294,7 @@ async def test_permit_wait_is_reported_separately_from_request_time(monkeypatch)
         llm = llm_wrapper.LLMConfig(provider="mock", api_key="", base_url="", model="m")
 
         async def fake_call(**kwargs):
-            return "ok"
+            return LLMCallResult(content="ok", usage=TokenUsage())
 
         monkeypatch.setattr(llm._provider_impl, "call", fake_call)
 
@@ -287,7 +302,7 @@ async def test_permit_wait_is_reported_separately_from_request_time(monkeypatch)
         await asyncio.sleep(_PERMIT_HOLD_SECONDS)
         assert not call.done(), "call should be queued behind the permit"
         saturated.release()
-        assert await call == "ok"
+        assert (await call).content == "ok"
     finally:
         reset_queue_wait_sink(token)
 
