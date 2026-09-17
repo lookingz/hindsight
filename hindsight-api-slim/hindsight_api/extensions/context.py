@@ -85,27 +85,29 @@ class DefaultExtensionContext(ExtensionContext):
         database_url: str,
         memory_engine: "MemoryEngineInterface | None" = None,
         webhook_manager: "WebhookManager | None" = None,
-        current_schema: str | None = None,
     ):
         """
         Initialize the context.
+
+        The context is one object shared by every request, so it deliberately carries no
+        per-request state (tenant schema, bank): that would be last-writer-wins under
+        concurrency. Hooks get the tenant/bank from their own arguments.
 
         Args:
             database_url: SQLAlchemy database URL for migrations.
             memory_engine: Optional MemoryEngine instance for memory operations.
             webhook_manager: Optional WebhookManager for firing webhooks.
-            current_schema: Optional current schema name for tenant context.
         """
         self._database_url = database_url
         self._memory_engine = memory_engine
         self.webhook_manager = webhook_manager
-        self.current_schema = current_schema
 
     async def run_migration(self, schema: str) -> None:
         """Run migrations for a specific schema."""
         import asyncio
 
         from hindsight_api.config import get_config
+        from hindsight_api.engine.memories import get_memories
         from hindsight_api.migrations import run_migrations_for_schemas
 
         # Prefer getting URL from memory engine (handles pg0 case where URL is set after init)
@@ -140,6 +142,7 @@ class DefaultExtensionContext(ExtensionContext):
             vector_extension=config.vector_extension,
             text_search_extension=config.text_search_extension,
             pg_search_tokenizer=config.text_search_extension_pg_search_tokenizer,
+            store_owned_memories=get_memories().store_owned,
         )
 
         # Provision any extension-owned bank-scoped tables for this schema,

@@ -12,19 +12,21 @@ import json
 import logging
 import os
 import re
+import time
 import traceback
 import uuid
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from hindsight_api.api import page_markdown
+from hindsight_api.api.admission import AdmissionAbandoned, AdmissionRejected, build_controller_from_config
 from hindsight_api.api.disconnect import ClientDisconnectCancellationMiddleware, get_scope_cancellation_token
 from hindsight_api.api.observability import HttpObservabilityMiddleware
 from hindsight_api.api.passthrough_headers import collect_passthrough_headers
@@ -885,6 +887,11 @@ def bank_attachment_url(bank_id: str, attachment_id: str) -> str:
     return f"/v1/default/banks/{quote(bank_id, safe='')}/attachments/{attachment_id}"
 
 
+# OpenAPI content entry for a raw-bytes response body, so generated clients
+# return bytes instead of trying to decode the payload.
+_BINARY_SCHEMA: dict[str, Any] = {"schema": {"type": "string", "format": "binary"}}
+
+
 def chunk_attachments_of(
     bank_id: str,
     text: str,
@@ -950,11 +957,27 @@ async def _attach_to_memories(
     LLM call attributes the diagram to the paragraph that never mentioned it.
 
     One lookup for the whole page, not one per memory.
+
+    A store that owns its rows renders them itself and puts each memory's ids on
+    the item as ``attachment_ids``. Those are taken off here — the key is an
+    internal carrier, and leaving it would make the payload differ by backend —
+    and handed to the engine, so the lookup resolves them instead of reading them
+    back from a table the store never wrote.
     """
-    unit_ids = [item.get("id") for item in items if isinstance(item, dict) and item.get("id")]
+    unit_ids: list[str] = []
+    carried: dict[str, tuple[str | None, list[str]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ids = item.pop("attachment_ids", None)
+        if not item.get("id"):
+            continue
+        unit_ids.append(item["id"])
+        if ids is not None:
+            carried[str(item["id"])] = (item.get("document_id"), list(ids))
     if not unit_ids:
         return
-    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context)
+    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
     if not by_unit:
         return
     for item in items:
@@ -968,6 +991,7 @@ async def _attach_to_recall_results(
     bank_id: str,
     results: "list[RecallResult]",
     request_context: RequestContext,
+    carried: "dict[str, tuple[str | None, list[str]]] | None" = None,
 ) -> None:
     """Add ``attachments`` to recall results — the same per-fact edge as :func:`_attach_to_memories`.
 
@@ -980,11 +1004,15 @@ async def _attach_to_recall_results(
     One lookup for the whole page. For a bank that has retained no attachments it
     is a single indexed read of the ids column that returns nothing to resolve,
     which is why this is unconditional rather than another `include` flag.
+
+    ``carried`` is unit id -> ``(document_id, attachment_ids)`` for results whose
+    ids the memories store returned on the row. For a store-owned bank that is the
+    only source: the engine resolves them and never reads ``memory_units``.
     """
     unit_ids = [result.id for result in results if result.id]
     if not unit_ids:
         return
-    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context)
+    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
     if not by_unit:
         return
     for result in results:
@@ -2743,6 +2771,19 @@ class DocumentExportSubmitResponse(BaseModel):
     status: str = "pending"
 
 
+class BankTransferSubmitResponse(BaseModel):
+    """Response for the unified bank-transfer endpoints (202).
+
+    The transfer runs in the background; poll
+    GET /v1/default/banks/{bank_id}/operations/{operation_id}. An export's
+    ``result_metadata`` carries ``download_url`` / ``storage_key`` /
+    ``byte_size`` / ``filename``; an import's carries the per-component counts.
+    """
+
+    operation_id: str
+    status: str = "pending"
+
+
 class DeleteResponse(BaseModel):
     """Response model for delete operations."""
 
@@ -3575,6 +3616,13 @@ class BankTemplateConfig(BaseModel):
     )
     reflect_source_facts_max_tokens: int | None = Field(
         default=None, description="Max tokens of source facts per reflect call"
+    )
+    knowledge_page_default_trigger: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Trigger fields merged over the built-in knowledge-page default when a page is created "
+            '(e.g. {"refresh_cron": "0 * * * *"}). A trigger sent with the create request still wins.'
+        ),
     )
     mental_model_min_refresh_interval_seconds: int | None = Field(
         default=None,
@@ -4623,7 +4671,12 @@ def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
 
                 try:
                     result = await func(*args, **kwargs)
-                    if hasattr(result, "model_dump"):
+                    if hasattr(result, "model_dump_json"):
+                        # One Rust pass to the JSON the row stores, instead of model_dump(mode="json")
+                        # building a Python dict of the whole response on the request path and the
+                        # writer re-encoding it. Same document either way.
+                        entry.response_json = result.model_dump_json()
+                    elif hasattr(result, "model_dump"):
                         entry.response = result.model_dump(mode="json")
                     elif isinstance(result, dict):
                         entry.response = result
@@ -4690,9 +4743,15 @@ def create_app(
         import socket
 
         from hindsight_api.config import get_config
+        from hindsight_api.loop_lag import install as _install_loop_lag
         from hindsight_api.worker import WorkerPoller
 
         config = get_config()
+
+        # Started here rather than at import time because it needs a running loop, and it must run
+        # on the loop that actually serves requests — that is the only one whose lag says anything.
+        _install_loop_lag(config.loop_lag_report_seconds, metric=config.loop_lag_metric)
+
         poller = None
         poller_task = None
         loop_watchdog = None
@@ -4706,6 +4765,12 @@ def create_app(
             prometheus_reader = initialize_metrics(service_name="hindsight-api", service_version="1.0.0")
             create_metrics_collector()
             app.state.prometheus_reader = prometheus_reader
+            if config.metrics_worker_label:
+                # With --workers N a scrape of /metrics reaches one random worker; make every
+                # worker's series part of every scrape (see hindsight_api.metrics_multiworker).
+                from hindsight_api.metrics_multiworker import start_worker_metrics
+
+                app.state.worker_metrics = start_worker_metrics(max(1, config.workers))
             logging.info("Metrics initialized - available at /metrics endpoint")
         except Exception as e:
             logging.warning(f"Failed to initialize metrics: {e}. Metrics will be disabled (using no-op collector).")
@@ -4846,7 +4911,12 @@ def create_app(
     app.state.memory = memory
     app.state.audit_logger = memory.audit_logger
 
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # Compressing a recall response costs ~5% of the request's CPU. Tunable so a deployment
+    # that is CPU-bound rather than bandwidth-bound can raise the floor past its response size.
+    # A negative floor drops the middleware entirely.
+    gzip_min_size = get_config().gzip_min_size
+    if gzip_min_size >= 0:
+        app.add_middleware(GZipMiddleware, minimum_size=gzip_min_size)
 
     # ---------------------------------------------------------------------------
     # Patch OpenAPI schema: align ValidationError with Pydantic v2 error format
@@ -4875,6 +4945,10 @@ def create_app(
     # reporting now happens in the route class (already resolved, nothing to
     # re-discover) and the metrics in a pure-ASGI middleware installed below.
     app.router.route_class = UnknownParamsRoute
+
+    # Per-operation admission control, consulted by the `admit_for` dependency on
+    # the heavy routes. One controller per app so the limits are a process budget.
+    app.state.admission = build_controller_from_config(config)
 
     # Register all routes
     _register_routes(app)
@@ -5022,6 +5096,8 @@ def _register_routes(app: FastAPI):
         empty by default, so no other header reaches extension code unless an
         operator opts in.
         """
+        # Dependency-resolution start, read by api_recall to split `http_to_handler`.
+        request.scope.setdefault("hs_deps_t0", time.time())
         api_key = None
         if authorization:
             if authorization.lower().startswith("bearer "):
@@ -5030,6 +5106,44 @@ def _register_routes(app: FastAPI):
                 api_key = authorization.strip()
         extra_headers = collect_passthrough_headers(request.headers.raw, get_config().extension_passthrough_headers)
         return RequestContext(api_key=api_key, extra_headers=extra_headers)
+
+    def admit_for(operation: PrecheckOperation):
+        """Build a FastAPI dependency that holds an admission permit for the request.
+
+        Yield-style so the permit is held for the whole request and released once the
+        response has been produced. Declared alongside ``precheck_for`` on the heavy
+        routes: FastAPI resolves dependencies before deserialising the body, so an
+        overloaded server refuses without ever reading the payload.
+
+        Returns 503 with ``Retry-After`` rather than queueing indefinitely — see
+        :mod:`hindsight_api.api.admission` for why the wait, not the concurrency, is
+        the thing worth bounding.
+        """
+
+        async def _admit_dep(request: Request):
+            controller = getattr(app.state, "admission", None)
+            if controller is None:
+                yield
+                return
+            # Recall and reflect carry a disconnect token (see api/disconnect.py). A
+            # queued request whose client has gone gives up its place immediately,
+            # which is what makes a patient deadline affordable.
+            abandoned = get_scope_cancellation_token(request.scope)
+            try:
+                async with controller.admit(str(operation), abandoned=abandoned):
+                    yield
+            except AdmissionAbandoned:
+                # Nobody left to answer. Close the request without spending a slot
+                # or building a response.
+                raise HTTPException(status_code=499, detail="client disconnected while queued") from None
+            except AdmissionRejected as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(f"Server is at capacity for '{e.lane}' ({e.limit} concurrent); try again shortly."),
+                    headers={"Retry-After": str(e.retry_after_seconds)},
+                ) from None
+
+        return _admit_dep
 
     def precheck_for(operation: PrecheckOperation):
         """
@@ -5068,7 +5182,9 @@ def _register_routes(app: FastAPI):
                 return
             from hindsight_api.extensions import PrecheckContext
 
+            _t0_dep_auth = time.time()
             await app.state.memory._authenticate_tenant(request_context)
+            get_metrics_collector().record_recall_phase("dep_auth", time.time() - _t0_dep_auth)
             cl_header = request.headers.get("content-length")
             content_length: int | None = None
             if cl_header is not None:
@@ -5084,12 +5200,16 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
                 content_length=content_length,
             )
+            _t0_dep_precheck = time.time()
             result = await validator.precheck(ctx)
+            get_metrics_collector().record_recall_phase("dep_precheck", time.time() - _t0_dep_precheck)
             if not result.allowed:
                 raise HTTPException(
                     status_code=result.status_code,
                     detail=result.reason or "Operation not allowed",
                 )
+
+            request.scope["hs_deps_done"] = time.time()
 
         return _precheck_dep
 
@@ -5224,7 +5344,8 @@ def _register_routes(app: FastAPI):
         from fastapi.responses import Response
         from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-        metrics_data = generate_latest()
+        worker_metrics = getattr(app.state, "worker_metrics", None)
+        metrics_data = worker_metrics.render() if worker_metrics is not None else generate_latest()
         return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
 
     @app.get(
@@ -5614,12 +5735,31 @@ def _register_routes(app: FastAPI):
         http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
         _precheck: None = Depends(precheck_for(PrecheckOperation.RECALL)),
+        _admit: None = Depends(admit_for(PrecheckOperation.RECALL)),
     ):
         """Run a recall and return results with trace."""
         import time
 
         handler_start = time.time()
         metrics = get_metrics_collector()
+        # Everything before this line — routing, body parsing, dependency resolution (auth among
+        # them) — is outside every timer the endpoint sets, so `pre=` cannot see it and a cost
+        # there reads as unattributed request time.
+        _asgi_t0 = http_request.scope.get("hs_asgi_t0")
+        if _asgi_t0:
+            metrics.record_recall_phase("http_to_handler", max(0.0, handler_start - _asgi_t0))
+            # Split it: middleware+routing, dependency resolution, then body read + validation.
+            # `http_to_handler` was a third of a recall with only its auth call timed, so the rest
+            # of it — Starlette routing, the two dependencies, and reading the request body off the
+            # socket — was a single opaque block.
+            _deps_t0 = http_request.scope.get("hs_deps_t0")
+            _deps_done = http_request.scope.get("hs_deps_done")
+            if _deps_t0:
+                metrics.record_recall_phase("mw_and_routing", max(0.0, _deps_t0 - _asgi_t0))
+            if _deps_t0 and _deps_done:
+                metrics.record_recall_phase("deps_total", max(0.0, _deps_done - _deps_t0))
+            if _deps_done:
+                metrics.record_recall_phase("body_parse", max(0.0, handler_start - _deps_done))
 
         # Validate query length to prevent expensive operations on oversized queries
         max_query_tokens = get_config().recall_max_query_tokens
@@ -5698,6 +5838,8 @@ def _register_routes(app: FastAPI):
                     operation="recall",
                     bank_id=bank_id,
                 )
+                engine_done = time.time()
+                metrics.record_recall_phase("engine_call", engine_done - recall_start, diagnostic=True)
 
             # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
             def _fact_to_result(fact: "MemoryFact") -> RecallResult:
@@ -5719,7 +5861,17 @@ def _register_routes(app: FastAPI):
                 )
 
             recall_results = [_fact_to_result(fact) for fact in core_result.results]
-            await _attach_to_recall_results(app.state.memory, bank_id, recall_results, request_context)
+            await _attach_to_recall_results(
+                app.state.memory,
+                bank_id,
+                recall_results,
+                request_context,
+                carried={
+                    fact.id: (fact.document_id, fact.attachment_ids)
+                    for fact in core_result.results
+                    if fact.attachment_ids is not None
+                },
+            )
 
             # Convert chunks from engine to HTTP API format
             chunks_response = None
@@ -5775,7 +5927,12 @@ def _register_routes(app: FastAPI):
             )
 
             handler_duration = time.time() - handler_start
-            recall_duration = time.time() - recall_start
+            # END OF THE ENGINE CALL, not end of handler. Measured at the end, this window also
+            # covered response building, and `post_recall` — computed as the remainder — was then
+            # ~0 by construction. That made a slow response-assembly path unreadable: the line
+            # said pre=0 post=0 and put every millisecond into `recall`, whatever spent it.
+            metrics.record_recall_phase("post_engine", max(0.0, time.time() - engine_done))
+            recall_duration = engine_done - recall_start
             post_recall = handler_duration - pre_recall - recall_duration
             if handler_duration > 1.0:
                 logging.info(
@@ -5831,6 +5988,7 @@ def _register_routes(app: FastAPI):
         http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
         _precheck: None = Depends(precheck_for(PrecheckOperation.REFLECT)),
+        _admit: None = Depends(admit_for(PrecheckOperation.REFLECT)),
     ):
         metrics = get_metrics_collector()
 
@@ -7221,7 +7379,13 @@ def _register_routes(app: FastAPI):
                 raise HTTPException(status_code=404, detail="Document not found")
             items = result.get("items") or []
             by_chunk = await app.state.memory.attachments_for_chunks(
-                bank_id, [c["chunk_id"] for c in items if c.get("chunk_id")], request_context
+                bank_id,
+                [c["chunk_id"] for c in items if c.get("chunk_id")],
+                request_context,
+                # The page already holds each chunk's text; a store-owned bank resolves from it.
+                carried_texts={
+                    c["chunk_id"]: (c.get("document_id"), c.get("chunk_text")) for c in items if c.get("chunk_id")
+                },
             )
             for chunk in items:
                 records = by_chunk.get(chunk.get("chunk_id"))
@@ -7300,7 +7464,19 @@ def _register_routes(app: FastAPI):
             document = await app.state.memory.get_document(document_id, bank_id, request_context=request_context)
             if not document:
                 raise HTTPException(status_code=404, detail="Document not found")
-            by_document = await app.state.memory.attachments_for_documents(bank_id, [document_id], request_context)
+            # A store-owned bank's document carries its attachment names from the record just
+            # read; taken off so the payload is the same shape on either backend, and handed on so
+            # the engine does not read that record a second time.
+            stored_names = document.pop("attachment_filenames", None)
+            by_document = await app.state.memory.attachments_for_documents(
+                bank_id,
+                [document_id],
+                request_context,
+                # Used only for a store-owned bank, which has no document edge to read; a null
+                # text (full text not kept) makes the engine fall back to the chunk texts.
+                carried_texts={document_id: document.get("original_text")},
+                carried_filenames=None if stored_names is None else {document_id: stored_names},
+            )
             if by_document.get(document_id):
                 document["attachments"] = [_attachment_payload(bank_id, record) for record in by_document[document_id]]
             return document
@@ -7401,7 +7577,12 @@ def _register_routes(app: FastAPI):
             # it belongs to, and attachments_for_chunks authorizes against it.
             chunk_bank = chunk.get("bank_id")
             if chunk_bank:
-                by_chunk = await app.state.memory.attachments_for_chunks(chunk_bank, [chunk_id], request_context)
+                by_chunk = await app.state.memory.attachments_for_chunks(
+                    chunk_bank,
+                    [chunk_id],
+                    request_context,
+                    carried_texts={chunk_id: (chunk.get("document_id"), chunk.get("chunk_text"))},
+                )
                 if by_chunk.get(chunk_id):
                     chunk["attachments"] = [_attachment_payload(chunk_bank, record) for record in by_chunk[chunk_id]]
             return chunk
@@ -8113,6 +8294,10 @@ def _register_routes(app: FastAPI):
         "Mental Models plus Knowledge Pages (all whole-bank export only).",
         operation_id="export_documents",
         tags=["Document Transfer"],
+        # Superseded by POST /v1/default/banks/{bank_id}/transfer/export, which
+        # carries the same document subsets plus the bank's own config and
+        # history. Kept working unchanged for existing callers.
+        deprecated=True,
     )
     async def api_export_documents(
         bank_id: str,
@@ -8171,6 +8356,10 @@ def _register_routes(app: FastAPI):
         "result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.",
         operation_id="import_documents",
         tags=["Document Transfer"],
+        # Superseded by POST /v1/default/banks/{bank_id}/transfer/import with
+        # mode=merge, which is this endpoint's behaviour under the unified
+        # vocabulary. Kept working unchanged for existing callers.
+        deprecated=True,
     )
     @audited("import_documents", request_param=None)
     async def api_import_documents(
@@ -8207,6 +8396,212 @@ def _register_routes(app: FastAPI):
         except Exception as e:
             raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/document-transfer")
 
+    # =====================================================================
+    # Bank Transfer (unified export / import)
+    # =====================================================================
+    #
+    # One archive format and one vocabulary for every transfer: what used to be
+    # the document-transfer pair plus the admin-only `hindsight-admin export-bank`
+    # / `import-bank`. Three booleans choose what travels:
+    #
+    #   include_data        documents, facts, observations, entities and links,
+    #                       attachments (bytes included), the curation archive,
+    #                       the operations log and the maintenance queues
+    #   include_bank_config the bank row (per-bank config), mental models and
+    #                       their refresh history, knowledge pages, directives,
+    #                       webhooks
+    #   include_history     audit_log and llm_requests
+    #
+    # The older endpoints stay, and keep their exact request and response shapes.
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/transfer/export",
+        response_model=BankTransferSubmitResponse,
+        status_code=202,
+        summary="Export a bank (async)",
+        description="Submit an async export of a bank as a transfer ZIP archive. Three flags choose what the "
+        "archive carries: include_data (documents, facts, observations, attachments and their bytes, the "
+        "curation archive, the operations log and the maintenance queues), include_bank_config (bank config, "
+        "mental models and their history, knowledge pages, directives, webhooks) and include_history "
+        "(audit_log, llm_requests). Embeddings and database ids are never carried — importing re-embeds with "
+        "the target bank's model and re-resolves entities, so an archive moves between instances configured "
+        "with different embedding models. Returns an operation_id; poll "
+        "GET /v1/default/banks/{bank_id}/operations/{operation_id}, then fetch the archive from the "
+        "download_url in its result_metadata. Pass document_id to export specific documents instead of the "
+        "whole bank (a document subset carries no bank-level sections).",
+        operation_id="export_bank_transfer",
+        tags=["Bank Transfer"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_bank_transfer_export(
+        bank_id: str,
+        include_data: bool = Query(default=True, description="Carry the memories and everything backing them"),
+        include_bank_config: bool = Query(default=True, description="Carry bank config, mental models, directives"),
+        include_history: bool = Query(default=False, description="Carry audit_log and llm_requests"),
+        document_id: list[str] | None = Query(default=None, description="Document id(s); omit for the whole bank"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit an async bank export."""
+        try:
+            if not get_config().enable_document_export_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Bank export API is disabled. Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
+                )
+            if not (include_data or include_bank_config or include_history):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nothing to export: set at least one of include_data, include_bank_config, include_history",
+                )
+            profile = await app.state.memory.get_bank_profile(
+                bank_id, request_context=request_context, create_if_missing=False
+            )
+            if profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+
+            from hindsight_api.engine.transfer import TransferScope
+
+            try:
+                if document_id:
+                    # A subset of documents is not a bank: the bank-level sections
+                    # describe the whole of it, and observations can span documents
+                    # outside the subset.
+                    if include_bank_config or include_history:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="include_bank_config and include_history are only supported for a whole-bank "
+                            "export (omit document_id)",
+                        )
+                    submission = await app.state.memory.submit_export_documents_async(
+                        bank_id,
+                        request_context,
+                        list(document_id),
+                    )
+                else:
+                    submission = await app.state.memory.submit_bank_export_async(
+                        bank_id,
+                        request_context,
+                        scope=TransferScope(
+                            data=include_data,
+                            bank_config=include_bank_config,
+                            history=include_history,
+                        ),
+                    )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            return BankTransferSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/transfer/export")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/transfer/import",
+        response_model=BankTransferSubmitResponse,
+        status_code=202,
+        summary="Import a bank (async)",
+        description="Submit a transfer archive (produced by the export endpoint) for import. Runs as a "
+        "background operation: facts are re-embedded with the target bank's embedding model and entities are "
+        "re-resolved — no LLM extraction, so the import costs no tokens and invents no new facts.\n\n"
+        "Two modes. `restore` (default) writes a whole bank into target_bank_id, which must NOT already exist "
+        "— it restores a bank rather than merging into one, and is how a bank is moved between instances or "
+        "copied under a new id. `merge` folds an archive's documents into this bank, with document_conflict "
+        "deciding what happens to ids that already exist (skip, replace, new-id).\n\n"
+        "The include flags narrow what is restored to a subset of what the archive holds; they cannot add "
+        "what the producer did not export. Returns an operation_id; poll "
+        "GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and per-component counts. The "
+        "operation is recorded against {bank_id} even in restore mode, because the target bank does not exist "
+        "yet.",
+        operation_id="import_bank_transfer",
+        tags=["Bank Transfer"],
+    )
+    @audited("import_bank_transfer", request_param=None)
+    async def api_bank_transfer_import(
+        bank_id: str,
+        file: UploadFile = File(..., description="Transfer ZIP archive"),
+        mode: str = Query(default="restore", description="restore (into a fresh bank) | merge (into this bank)"),
+        target_bank_id: str | None = Query(
+            default=None, description="restore mode: the bank to create; defaults to the archive's source bank"
+        ),
+        document_conflict: str = Query(default="skip", description="merge mode: skip | replace | new-id"),
+        # Optional rather than defaulted, so "not passed" is distinguishable from
+        # "passed the default": merge mode takes documents only, and accepting a
+        # scope flag there would silently do nothing (rejected below instead).
+        include_data: bool | None = Query(
+            default=None, description="restore mode: carry the memories and everything backing them (default true)"
+        ),
+        include_bank_config: bool | None = Query(
+            default=None, description="restore mode: carry bank config, mental models, directives (default true)"
+        ),
+        include_history: bool | None = Query(
+            default=None, description="restore mode: carry audit_log and llm_requests (default false)"
+        ),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit a transfer archive for async import."""
+        try:
+            if not get_config().enable_document_import_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Bank import API is disabled. Set HINDSIGHT_API_ENABLE_DOCUMENT_IMPORT_API=true to enable.",
+                )
+            if mode not in ("restore", "merge"):
+                raise HTTPException(status_code=400, detail=f"Invalid mode '{mode}' (expected restore|merge)")
+            if document_conflict not in ("skip", "replace", "new-id"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid document_conflict '{document_conflict}' (expected skip|replace|new-id)",
+                )
+            archive_bytes = await file.read()
+
+            from hindsight_api.engine.transfer import TransferScope
+
+            try:
+                if mode == "merge":
+                    if target_bank_id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="target_bank_id is only valid in restore mode; merge imports into {bank_id}",
+                        )
+                    # A merge takes the archive's documents and nothing else, so a
+                    # scope flag here would be accepted and then do nothing —
+                    # refuse it rather than quietly ignore a caller who asked for
+                    # the bank's config.
+                    if include_data is not None or include_bank_config is not None or include_history is not None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="include_data / include_bank_config / include_history apply to mode=restore; "
+                            "a merge imports the archive's documents only",
+                        )
+                    submission = await app.state.memory.import_documents_async(
+                        bank_id, archive_bytes, request_context, document_conflict
+                    )
+                else:
+                    submission = await app.state.memory.submit_bank_import_async(
+                        bank_id,
+                        archive_bytes,
+                        request_context,
+                        target_bank_id=target_bank_id,
+                        scope=TransferScope(
+                            data=True if include_data is None else include_data,
+                            bank_config=True if include_bank_config is None else include_bank_config,
+                            history=False if include_history is None else include_history,
+                        ),
+                    )
+            except ValueError as e:
+                # Invalid archive, unsupported schema version, or a target bank
+                # that already exists — all caller errors.
+                raise HTTPException(status_code=400, detail=str(e))
+            return BankTransferSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/transfer/import")
+
     @app.get(
         "/v1/default/banks/{bank_id}/attachments/{attachment_id}",
         summary="Fetch an attachment retained inline with a document",
@@ -8219,7 +8614,11 @@ def _register_routes(app: FastAPI):
         "cannot be used to probe what a bank holds.",
         operation_id="get_bank_attachment",
         tags=["Memory"],
-        responses={200: {"content": {"application/octet-stream": {}}, "description": "Attachment bytes"}},
+        # An explicit response_class stops FastAPI adding its default
+        # application/json media type next to the binary one, which made the
+        # generated clients decode the bytes as JSON text (#4292).
+        response_class=Response,
+        responses={200: {"content": {"application/octet-stream": _BINARY_SCHEMA}, "description": "Attachment bytes"}},
     )
     async def api_get_bank_attachment(
         bank_id: str,
@@ -8227,7 +8626,6 @@ def _register_routes(app: FastAPI):
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Serve one of a bank's retained inline attachments."""
-        from fastapi.responses import Response
 
         try:
             attachment = await app.state.memory.retrieve_bank_attachment(bank_id, attachment_id, request_context)
@@ -8266,14 +8664,14 @@ def _register_routes(app: FastAPI):
         "download_url). Access is authorized against the bank the key belongs to.",
         operation_id="download_file",
         tags=["Document Transfer"],
-        responses={200: {"content": {"application/zip": {}}, "description": "Stored file"}},
+        response_class=Response,
+        responses={200: {"content": {"application/zip": _BINARY_SCHEMA}, "description": "Stored file"}},
     )
     async def api_download_file(
         key: str,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Download a bank-scoped stored file (export archive) by storage key."""
-        from fastapi.responses import Response
 
         try:
             if not get_config().enable_document_export_api:
@@ -8283,15 +8681,21 @@ def _register_routes(app: FastAPI):
                     "Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
                 )
             # Only bank-scoped keys are downloadable. Parse the bank id out of the
-            # "banks/{bank_id}/..." key (request validation, so it belongs here); the
-            # engine method then authorizes the caller against that bank and retrieves
-            # the file, so a caller can't fetch another tenant's or bank's archive
-            # (IDOR guard). The unguessable uuid in the key is defence in depth, not
-            # the access control.
+            # "tenants/{schema}/banks/{bank_id}/..." key — or the "banks/{bank_id}/..."
+            # layout written before keys carried the tenant (request validation, so it
+            # belongs here); the engine method then authorizes the caller against that
+            # bank, in their own tenant, and retrieves the file, so a caller can't fetch
+            # another tenant's or bank's archive (IDOR guard). The unguessable uuid in
+            # the key is defence in depth, not the access control.
             parts = key.split("/")
-            if ".." in parts or len(parts) < 2 or parts[0] != "banks" or not parts[1]:
+            if ".." in parts:
                 raise HTTPException(status_code=404, detail="File not found")
-            bank_id = parts[1]
+            if len(parts) > 4 and parts[0] == "tenants" and parts[2] == "banks" and parts[3]:
+                bank_id = unquote(parts[3])
+            elif len(parts) > 2 and parts[0] == "banks" and parts[1]:
+                bank_id = parts[1]
+            else:
+                raise HTTPException(status_code=404, detail="File not found")
 
             data = await app.state.memory.retrieve_bank_file(bank_id, key, request_context)
             if data is None:
@@ -8906,6 +9310,7 @@ def _register_routes(app: FastAPI):
         request: RetainRequest,
         request_context: RequestContext = Depends(get_request_context),
         _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
+        _admit: None = Depends(admit_for(PrecheckOperation.RETAIN)),
     ):
         """Retain memories with optional async processing."""
         metrics = get_metrics_collector()
@@ -8922,6 +9327,7 @@ def _register_routes(app: FastAPI):
             # and silently delete every screenshot in the article. Only paid for
             # when the caller actually wrote something placeholder-shaped.
             allowed_by_document: dict[str, set[str]] = {}
+            names_by_document: dict[str, dict[str, str]] = {}
             revisited = {
                 item.document_id
                 for item in request.items
@@ -8931,6 +9337,13 @@ def _register_routes(app: FastAPI):
                 existing = await app.state.memory.attachments_for_documents(bank_id, sorted(revisited), request_context)
                 allowed_by_document = {
                     document_id: {record.short_id for record in records} for document_id, records in existing.items()
+                }
+                # The names those attachments already have. The edit re-sends only placeholders,
+                # so without these a store-owned document -- whose record's names are replaced on
+                # every write -- would lose them. A SQL bank merges the same names back itself.
+                names_by_document = {
+                    document_id: {record.short_id: record.filename for record in records if record.filename}
+                    for document_id, records in existing.items()
                 }
 
             canonical_contents = [
@@ -8964,6 +9377,13 @@ def _register_routes(app: FastAPI):
                     for attachment in canonical.attachments
                     if attachment.filename
                 }
+                kept_names = names_by_document.get(item.document_id or "")
+                if kept_names:
+                    referenced = set(iter_placeholder_ids(canonical.text))
+                    item_filenames = {
+                        **{short_id: name for short_id, name in kept_names.items() if short_id in referenced},
+                        **item_filenames,
+                    }
                 if item_filenames:
                     content_dict["attachment_filenames"] = item_filenames
                 if item.timestamp == "unset":
@@ -9312,11 +9732,20 @@ def _register_routes(app: FastAPI):
     ):
         """Clear memories for a memory bank, optionally filtered by type."""
         try:
-            await app.state.memory.delete_bank(
+            result = await app.state.memory.delete_bank(
                 bank_id, fact_type=type, delete_bank_profile=False, request_context=request_context
             )
 
-            return DeleteResponse(success=True)
+            # Counted inside the delete's transaction — a client's before/after list diff races
+            # concurrent retains (#4307). Memory units only: unlike api_delete_bank, the bank's
+            # entities and documents survive a clear.
+            deleted = result.get("memory_units_deleted", 0)
+            scope = f" of type '{type}'" if type else ""
+            return DeleteResponse(
+                success=True,
+                message=f"Cleared {deleted} memory unit(s){scope} from bank '{bank_id}'",
+                deleted_count=deleted,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):

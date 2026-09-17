@@ -15,6 +15,7 @@ import asyncio
 import importlib
 import logging
 import os
+import random
 import re
 
 _resource_mod = importlib.import_module("resource") if importlib.util.find_spec("resource") else None
@@ -164,6 +165,10 @@ logger = logging.getLogger(__name__)
 _meter = None
 
 
+#: Event-loop lag in seconds. Healthy is well under 10 ms; a saturated loop runs into seconds.
+LOOP_LAG_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
+
+
 def initialize_metrics(service_name: str = "hindsight-api", service_version: str = "1.0.0"):
     """
     Initialize OpenTelemetry metrics with Prometheus exporter.
@@ -212,7 +217,15 @@ def initialize_metrics(service_name: str = "hindsight-api", service_version: str
     provider = MeterProvider(
         resource=resource,
         metric_readers=[prometheus_reader],
-        views=[duration_view, llm_duration_view, http_duration_view],
+        views=[
+            duration_view,
+            llm_duration_view,
+            http_duration_view,
+            View(
+                instrument_name="hindsight.event_loop.lag",
+                aggregation=ExplicitBucketHistogramAggregation(boundaries=LOOP_LAG_BUCKETS),
+            ),
+        ],
     )
 
     # Set the global meter provider
@@ -320,6 +333,13 @@ class MetricsCollectorBase:
         """Record a detected event-loop stall (blocked longer than the watchdog threshold)."""
         raise NotImplementedError
 
+    def record_loop_lag(self, lag_seconds: float):
+        """Record one event-loop lag sample (see ``hindsight_api.loop_lag``).
+
+        A no-op here rather than abstract: the probe calls it on every tick, and a collector that
+        predates it must not kill the probe.
+        """
+
     def record_consolidation_batch_failure(self, failure_class: str, error_type: str):
         """Record one consolidation LLM batch call that failed.
 
@@ -406,6 +426,10 @@ class NoOpMetricsCollector(MetricsCollectorBase):
         """No-op loop-stall recording."""
         pass
 
+    def record_loop_lag(self, lag_seconds: float):
+        """No-op loop-lag recording."""
+        pass
+
     def record_consolidation_batch_failure(self, failure_class: str, error_type: str):
         """No-op consolidation batch-failure recording."""
         pass
@@ -423,6 +447,8 @@ class MetricsCollector(MetricsCollectorBase):
         from .config import get_config
 
         self._include_bank_id = get_config().metrics_include_bank_id
+        self._record_diagnostic_phases = get_config().recall_diagnostic_phases
+        self._recall_phase_sample_every = get_config().recall_phase_sample_every
 
         # Operation latency histogram (in seconds)
         # Records duration of retain, recall, reflect operations
@@ -538,11 +564,6 @@ class MetricsCollector(MetricsCollectorBase):
             description="Time in an operation-validator hook, which runs outside the operation's own timer",
             unit="s",
         )
-        self.validator_phase_calls = self.meter.create_counter(
-            name="hindsight.validator.phase.calls",
-            description="Number of operation-validator hook invocations",
-            unit="calls",
-        )
         # A recall's phases, from the same tracer that writes the `[phases]` log line. That line is
         # per-request and lives in a log; this is the aggregate, so "where does a recall's time go"
         # is answerable across a window without grepping. `hindsight.operation.duration` for a
@@ -582,11 +603,6 @@ class MetricsCollector(MetricsCollectorBase):
                 10.0,
             ],
         )
-        self.recall_phase_calls = self.meter.create_counter(
-            name="hindsight.recall.phase.calls",
-            description="Number of times a recall phase ran",
-            unit="calls",
-        )
         # Consolidation batch calls that failed. Labelled by failure class so the two
         # populations stay separable: `retry` is transport-shaped and usually self-heals,
         # while `fail_fast` is the model emitting something the response schema rejects —
@@ -608,6 +624,14 @@ class MetricsCollector(MetricsCollectorBase):
         self.event_loop_stall_duration = self.meter.create_histogram(
             name="hindsight.event_loop.stall_duration",
             description="Duration of detected event-loop stalls in seconds",
+            unit="s",
+        )
+        # How long a ready coroutine waited for the loop (see hindsight_api.loop_lag). Unlike a
+        # stall, which only counts blocks past a threshold, this is the whole distribution, so a
+        # loop that is busy but never blocked still shows up.
+        self.event_loop_lag = self.meter.create_histogram(
+            name="hindsight.event_loop.lag",
+            description="Event-loop lag: extra time a ready coroutine waited before it ran",
             unit="s",
         )
 
@@ -864,7 +888,6 @@ class MetricsCollector(MetricsCollectorBase):
         """Record one operation-validator hook. `hook` is "pre" or "post"."""
         attrs = {"operation": operation, "hook": hook, "tenant": _get_tenant()}
         self.validator_phase_duration.record(seconds, attrs)
-        self.validator_phase_calls.add(1, attrs)
 
     def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
         """Record one phase of a recall.
@@ -873,14 +896,28 @@ class MetricsCollector(MetricsCollectorBase):
         per-arm timing inside `parallel_retrieval`, say — so a consumer summing phases into a
         request total can exclude them instead of double-counting.
         """
+        if diagnostic and not self._record_diagnostic_phases:
+            return
+        # Opt-in sampling: ~10 phases per recall each go through OTel's aggregation, which was
+        # ~4.6% of a recall-heavy API's busy CPU. Sampling each call independently at 1/N keeps
+        # every phase's distribution (and so its percentiles) unbiased; only the histogram's
+        # absolute counts scale by 1/N. Default 1 records every call, exactly as before.
+        if self._recall_phase_sample_every > 1 and random.random() * self._recall_phase_sample_every >= 1.0:
+            return
         attrs = {"phase": phase, "tenant": _get_tenant(), "diagnostic": str(bool(diagnostic)).lower()}
+        # One instrument, not two: the histogram already carries `_count` for this attribute set,
+        # so the parallel counter was recording the same measurement a second time — and OTel's
+        # consume_measurement path, not the record call, is what costs.
         self.recall_phase_duration.record(seconds, attrs)
-        self.recall_phase_calls.add(1, attrs)
 
     def record_loop_stall(self, stall_seconds: float):
         """Record a detected event-loop stall. Called from the watchdog thread."""
         self.event_loop_stalls.add(1)
         self.event_loop_stall_duration.record(stall_seconds)
+
+    def record_loop_lag(self, lag_seconds: float):
+        """Record one event-loop lag sample. Called by the probe on every tick."""
+        self.event_loop_lag.record(lag_seconds)
 
     def record_consolidation_batch_failure(self, failure_class: str, error_type: str):
         """Record one failed consolidation LLM batch call.

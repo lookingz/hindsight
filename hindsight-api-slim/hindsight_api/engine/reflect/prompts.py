@@ -240,6 +240,8 @@ def build_system_prompt_for_tools(
             "- Be a thoughtful interpreter, not just a literal repeater",
             "- When the exact answer isn't stated, use what IS stated to give a best-effort answer AND surface any uncertainty — never invent confidence the data doesn't support.",
             "",
+            _GROUNDING_BOUNDARY,
+            "",
             "## Temporal Reasoning",
             "Every memory and observation carries temporal fields in the JSON tool result:",
             "- `mentioned_at` — when the user retained the fact (always set).",
@@ -547,11 +549,36 @@ _SPLIT_SYNTHESIS_WARN_CHUNKS = 4
 #: safe for any real model, so the floor caps fan-out without dropping data.
 _MIN_SPLIT_CHUNK_TOKENS = 1024
 
+#: The line between synthesis and invention, shared by every path that writes an
+#: answer (the tool-loop system prompt, the forced-synthesis system prompt, and
+#: the final-synthesis instructions) so they cannot drift apart.
+#:
+#: Reflect is told throughout to infer rather than repeat literally, which is
+#: what makes it useful. But "if the exact answer isn't stated, use what IS
+#: stated" has no floor: asked for a headcount in a year the bank does not cover,
+#: a model extrapolated backwards from the following year's growth trend and
+#: reported a specific number as "reliably deduced". That is not a hedge — it is
+#: a fabricated data point wearing the language of certainty, and it is worse
+#: than "not recorded" because a reader cannot tell the difference.
+#:
+#: The distinction that holds: inference may CHARACTERISE what the data covers;
+#: it may not MANUFACTURE a value for something the data does not cover.
+_GROUNDING_BOUNDARY = (
+    "## What Counts As Inference\n"
+    "Infer freely about what the retrieved data covers. Never produce a value (number, date, name, "
+    "status, amount) for a period, entity or person the data does not cover: extrapolating a trend, "
+    "interpolating between dated facts, or borrowing from a similar entity is invention. If no fact "
+    "states the value for the thing asked, say the data does not record it (a complete answer), then "
+    "give what IS recorded, labelled with the period or entity it belongs to. Never call a derived "
+    "value exact, reliable, deduced or confirmed; label any derivation an estimate. Qualitative "
+    "inference is unaffected."
+)
+
 _FINAL_INSTRUCTIONS = (
     "Provide a thoughtful answer by synthesizing and reasoning from the retrieved data above. "
     "You can make reasonable inferences from the memories, but don't completely fabricate information. "
-    "If the exact answer isn't stated, use what IS stated to give the best possible answer. "
-    "Only say 'I don't have information' if the retrieved data is truly unrelated to the question.\n\n"
+    "If the exact answer isn't stated, use what IS stated to give the best possible answer, "
+    "within the inference rules in the system prompt.\n\n"
     "IMPORTANT: Output ONLY the final answer. Do NOT include meta-commentary like "
     '"I\'ll search..." or "Let me analyze...". Do NOT explain your reasoning process. '
     "Just provide the direct synthesized answer."
@@ -874,7 +901,7 @@ Your approach:
 - Be helpful - if you have related information, use it to give the best possible answer
 - ONLY use information from tool results - no external knowledge or guessing
 
-Only say "I don't have information" if the retrieved data is truly unrelated to the question.
+{grounding_boundary}
 
 FORMATTING: Use proper markdown formatting in your answer:
 - Headers (##, ###) for sections
@@ -942,7 +969,7 @@ def build_final_system_prompt(
     role_section = escape_for_prompt(mission.strip()) if mission else _DEFAULT_FINAL_ROLE
 
     parts = [build_directives_section(directives) if directives else ""]
-    parts.append(_FINAL_SYSTEM_PROMPT_BASE.format(role_section=role_section))
+    parts.append(_FINAL_SYSTEM_PROMPT_BASE.format(role_section=role_section, grounding_boundary=_GROUNDING_BOUNDARY))
     parts.append(default_language_section(_FINAL_LANGUAGE_RULE, llm_output_language))
     parts.append(build_directives_reminder(directives) if directives else "")
     # Volatile "now" reference last, so the static/per-bank instructions above
@@ -966,9 +993,23 @@ You will be given:
    (1..6) and an ordered list of ``blocks``. Each block has a stable ``id`` and
    a ``text`` field holding one markdown fragment — a paragraph, a list, a
    table, or a fenced code block.
-3. NEW INFORMATION SYNTHESIS (markdown) — a synthesis showing how the new facts
+3. NEW INFORMATION SYNTHESIS (markdown) — UNTRUSTED. Prose written by another
+   model that saw ONLY the supporting facts below. It is a reading aid, not
+   evidence, and it is frequently wrong about what exists: it says things like
+   "no X was found" or "a total of N" when X is merely absent from this batch
+   and N counts only this batch. NEVER edit the document on the strength of a
+   sentence in the synthesis — only the SUPPORTING FACTS justify an operation.
+   A synthesis showing how the new facts
    relate to the document's topic. Use it to understand context and relevance,
    but do NOT copy its formatting or wording wholesale.
+   It was written from the SUPPORTING FACTS BELOW AND NOTHING ELSE. It could not
+   see the current document or any earlier fact, so every count, total, list or
+   summary in it describes ONLY the new facts — never the topic as a whole.
+   "A total of 4 customers..." in the synthesis means four in this batch, not
+   four altogether. Such a figure NEVER contradicts a different figure in the
+   document: the document counted what it could see, the synthesis counted what
+   it could see, and the answer is usually the two combined. Likewise the
+   synthesis saying nothing about something is not evidence against it.
 4. SUPPORTING FACTS — observations and facts created since the last refresh.
    These are genuinely new — they were NOT available when the current document
    was written.
@@ -1005,6 +1046,24 @@ RULES
 - **Update** existing content with ``replace_block`` or ``replace_section_blocks``
   when new facts provide corrections, updates, or more specific information
   about topics already in the document.
+- **Absence is not contradiction**: an entity, count or detail missing from
+  SUPPORTING FACTS is NOT thereby wrong, superseded or removed. The facts are one
+  batch, not the whole memory — the document was built from facts you cannot see.
+  "The batch does not mention X" and "X did not happen" are different statements,
+  and only the second would justify an edit. This applies to the SYNTHESIS too: if
+  it reports that something is absent, unrecorded or not found, that is a
+  statement about the batch, never about the topic.
+- **Refutation threshold for removal or overwrite**: you may only remove or
+  overwrite existing text when a SUPPORTING FACT explicitly refutes or corrects
+  that exact detail, OR is a later-DATED statement about the same facet (a
+  status, count, owner or location that has since changed). "Later" is about
+  the dates the texts give, never about arrival: facts reach you out of date
+  order, and a fact dated before the state the document records is backfilled
+  history — it belongs in the history, not in place of the current state, even
+  when the synthesis calls it current. Failing both tests, keep the
+  existing text: use ``append_block`` / ``insert_block``, or re-emit the block
+  with the new detail merged into a cohesive statement that still carries the old
+  one. Combining two disjoint sets is a merge, never a replacement.
 - **Remove** content with ``remove_block`` or ``remove_section`` ONLY when
   the new facts explicitly contradict or supersede it.
 - Prefer the *smallest* operation that expresses the change: appending or
@@ -1137,6 +1196,47 @@ def _fit_structured_delta_prompt_parts(
     return FittedDeltaPrompt(doc_json, candidate, facts_body, truncated)
 
 
+def build_mental_model_refresh_context(name: str, *, delta: bool) -> str:
+    """The reflect ``context`` for a mental-model refresh.
+
+    Facts reach a page out of date order: a later refresh can bring events OLDER than
+    the state the page already records. Two things keep that resolvable, and they
+    pull in opposite directions, so full and delta refreshes get different advice:
+
+    - a full refresh writes the page, so it must say since when each current state
+      holds — otherwise a backfilled event has nothing to be compared against;
+    - a delta refresh's synthesis is written from the new batch alone, so it must not
+      call anything current. "X owns it as of April 2024" reads to the delta step as
+      superseding a November-2024 owner the batch never saw; dated events merge.
+    """
+    context = (
+        f'You are writing a document called "{name}". '
+        "ONLY include content that directly answers the topic query. "
+        "Discard observations that are tangential or off-topic — retrieval may return "
+        "loosely related content that does not belong in this document.\n\n"
+        "Quality guidelines:\n"
+        "- Preserve concrete examples, before/after pairs, and sample sentences "
+        "from the observations. These teach more than abstract rules.\n"
+        "- If observations contain illustrative examples (e.g. ✅/❌ pairs, "
+        "rewrites, sample phrases), include them in your answer.\n"
+        "- Structure the document around the topic, not around the sources.\n"
+    )
+    if delta:
+        return context + (
+            "- You are only seeing information added since this document was last "
+            "updated, not its full history, and it may be older than what the "
+            "document already records. Report it as dated events (e.g. 'In April "
+            "2024, X passed to Y'). Do NOT say what is current, latest, still true "
+            "or remains the case, and do not conclude something did not happen."
+        )
+    return context + (
+        "- When you state something that changes over time (an owner, version, "
+        "status or count), say since when it has been true (e.g. 'since November "
+        "2024') and keep the dated history, so a later update that brings older "
+        "events can tell which one is current."
+    )
+
+
 def build_structured_delta_prompt(
     *,
     current_document_json: str,
@@ -1209,7 +1309,12 @@ def build_structured_delta_prompt(
         "## Task\n"
         "Output a JSON object matching the operations schema. Integrate the new "
         "supporting facts into CURRENT DOCUMENT. Add, update, or remove content "
-        "as needed. Preserve unchanged sections and blocks by not mentioning them."
+        "as needed. Preserve unchanged sections and blocks by not mentioning them.\n"
+        "Facts arrive out of date order. Before changing what the document says is "
+        "current (an owner, version, status or count), put the dated events from the "
+        "document and the new facts on one timeline: the latest-dated event is the "
+        "current state, wherever it came from. A new fact dated earlier than the "
+        "document's current state only adds history."
     )
     input_cap = max_input_tokens if max_input_tokens is not None else _STRUCTURED_DELTA_DEFAULT_MAX_INPUT_TOKENS
     fitted = _fit_structured_delta_prompt_parts(

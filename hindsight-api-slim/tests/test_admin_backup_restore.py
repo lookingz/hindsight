@@ -304,7 +304,7 @@ async def test_backup_restore_roundtrip(backup_test_schema):
 
         # Create some test memory units with embeddings
         # Convert embedding list to pgvector format string
-        embedding_list = embeddings.encode(["Test content about Alice"])[0]
+        embedding_list = (await embeddings.encode(["Test content about Alice"]))[0]
         embedding_str = "[" + ",".join(str(x) for x in embedding_list) + "]"
         for text in [
             "Alice is a software engineer who loves Python.",
@@ -480,7 +480,7 @@ async def test_backup_restore_preserves_all_column_types(backup_test_schema):
 
         # Create a memory unit with all column types
         # Convert embedding list to pgvector format string
-        embedding_list = embeddings.encode(["John Smith engineer"])[0]
+        embedding_list = (await embeddings.encode(["John Smith engineer"]))[0]
         embedding_str = "[" + ",".join(str(x) for x in embedding_list) + "]"
         await conn.execute(
             f"""INSERT INTO {_fq("memory_units")}
@@ -839,6 +839,7 @@ async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(m
         database_url: str,
         vector_extension: str = "pgvector",
         schema: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
 
@@ -847,6 +848,7 @@ async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(m
         text_search_extension: str = "native",
         schema: str | None = None,
         pg_search_tokenizer: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
 
@@ -912,6 +914,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
         dimension: int,
         schema: str | None = None,
         vector_extension: str = "pgvector",
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_embedding_dimension"].append((database_url, dimension, schema, vector_extension))
 
@@ -919,6 +922,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
         database_url: str,
         vector_extension: str = "pgvector",
         schema: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
 
@@ -927,6 +931,7 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
         text_search_extension: str = "native",
         schema: str | None = None,
         pg_search_tokenizer: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
 
@@ -998,6 +1003,7 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
         database_url: str,
         vector_extension: str = "pgvector",
         schema: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_vector_extension"].append((database_url, vector_extension, schema))
 
@@ -1006,6 +1012,7 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
         text_search_extension: str = "native",
         schema: str | None = None,
         pg_search_tokenizer: str | None = None,
+        store_owned_memories: bool = False,
     ) -> None:
         calls["ensure_text_search_extension"].append((database_url, text_search_extension, pg_search_tokenizer, schema))
 
