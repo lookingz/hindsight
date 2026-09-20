@@ -647,6 +647,14 @@ export type BankTemplateConfig = {
     [key: string]: unknown;
   } | null;
   /**
+   * Reflect Default Options
+   *
+   * Default reflect options for this bank (e.g. {"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}). Applied to every reflect in the bank -- API, MCP and mental-model refresh -- whenever the request (or the model's trigger) leaves the option unset.
+   */
+  reflect_default_options?: {
+    [key: string]: unknown;
+  } | null;
+  /**
    * Mental Model Min Refresh Interval Seconds
    *
    * Minimum seconds between two automatic refreshes of the same mental model in this bank. 0 (the default) means no floor. Overridable per model via the trigger's min_refresh_interval_seconds.
@@ -2809,6 +2817,8 @@ export type KnowledgePageSearchResult = {
   snippet: string;
   /**
    * Score
+   *
+   * Rank-fusion score in 0..1, where 1.0 means every search arm placed this page first. It reflects where the page ranked for this query, not how well its text matched, so it is only comparable within one result set.
    */
   score: number;
   /**
@@ -4439,8 +4449,24 @@ export type MentalModelTraceToolCall = {
  * MentalModelTrigger
  *
  * Trigger settings for a mental model.
+ *
+ * Inherits the reflect options an operator can also default per bank
+ * (``reflect_default_options``): set here they apply to this model's refreshes
+ * only, and win over the bank default.
  */
 export type MentalModelTriggerInput = {
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Mode
    *
@@ -4533,8 +4559,24 @@ export type MentalModelTriggerInput = {
  * MentalModelTrigger
  *
  * Trigger settings for a mental model.
+ *
+ * Inherits the reflect options an operator can also default per bank
+ * (``reflect_default_options``): set here they apply to this model's refreshes
+ * only, and win over the bank default.
  */
 export type MentalModelTriggerOutput = {
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Mode
    *
@@ -5526,6 +5568,18 @@ export type ReflectMentalModel = {
  * Request model for reflect endpoint.
  */
 export type ReflectRequest = {
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Query
    */
@@ -6808,6 +6862,30 @@ export type ListMemoriesData = {
      * Tags Match
      */
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Time Field
+     *
+     * Time axis to filter and order by. `created_at` / `updated_at` = ingest and last-write time; `mentioned_at` / `occurred_start` / `occurred_end` = event time. Defaults to `created_at` when only `start_date`/`end_date` are given. Filtering and ordering both follow `time_field`, and rows with no value on that column are excluded — so `total` counts only rows carrying that timestamp, and can be 0 on a bank that is not empty.
+     */
+    time_field?:
+      | "created_at"
+      | "updated_at"
+      | "mentioned_at"
+      | "occurred_start"
+      | "occurred_end"
+      | null;
+    /**
+     * Start Date
+     *
+     * Filter from this ISO datetime (inclusive)
+     */
+    start_date?: string | null;
+    /**
+     * End Date
+     *
+     * Filter until this ISO datetime (exclusive)
+     */
+    end_date?: string | null;
     /**
      * Limit
      */
@@ -8455,6 +8533,24 @@ export type ListDocumentsData = {
      */
     tags_match?: string;
     /**
+     * Time Field
+     *
+     * Time axis to filter and order by: `created_at` (when the document first arrived) or `updated_at` (its last write, the default ordering). Filtering and ordering both follow `time_field`, and rows with no value on that column are excluded — so `total` counts only rows carrying that timestamp, and can be 0 on a bank that is not empty.
+     */
+    time_field?: "created_at" | "updated_at" | null;
+    /**
+     * Start Date
+     *
+     * Filter from this ISO datetime (inclusive)
+     */
+    start_date?: string | null;
+    /**
+     * End Date
+     *
+     * Filter until this ISO datetime (exclusive)
+     */
+    end_date?: string | null;
+    /**
      * Limit
      */
     limit?: number;
@@ -9510,7 +9606,7 @@ export type ExportBankTransferData = {
     /**
      * Include Bank Config
      *
-     * Carry bank config, mental models, directives
+     * Carry the bank's config overrides, directives and webhooks
      */
     include_bank_config?: boolean;
     /**
@@ -9594,7 +9690,7 @@ export type ImportBankTransferData = {
     /**
      * Include Bank Config
      *
-     * restore mode: carry bank config, mental models, directives (default true)
+     * restore mode: restore the bank's config overrides, directives and webhooks (default true)
      */
     include_bank_config?: boolean | null;
     /**
@@ -9625,6 +9721,71 @@ export type ImportBankTransferResponses = {
 
 export type ImportBankTransferResponse =
   ImportBankTransferResponses[keyof ImportBankTransferResponses];
+
+export type CloneBankData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query: {
+    /**
+     * Target Bank Id
+     *
+     * Bank to create; must not already exist
+     */
+    target_bank_id: string;
+    /**
+     * Include Data
+     *
+     * Copy the memories, what backs them, and the mental models and knowledge pages synthesized from them
+     */
+    include_data?: boolean;
+    /**
+     * Include Bank Config
+     *
+     * Copy the bank's config overrides, directives and webhooks
+     */
+    include_bank_config?: boolean;
+    /**
+     * Include History
+     *
+     * Copy audit_log and llm_requests
+     */
+    include_history?: boolean;
+  };
+  url: "/v1/default/banks/{bank_id}/clone";
+};
+
+export type CloneBankErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CloneBankError = CloneBankErrors[keyof CloneBankErrors];
+
+export type CloneBankResponses = {
+  /**
+   * Successful Response
+   */
+  202: BankTransferSubmitResponse;
+};
+
+export type CloneBankResponse = CloneBankResponses[keyof CloneBankResponses];
 
 export type GetBankAttachmentData = {
   body?: never;

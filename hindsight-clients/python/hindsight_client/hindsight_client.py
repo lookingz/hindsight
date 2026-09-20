@@ -717,6 +717,8 @@ class Hindsight:
         fact_types: list[str] | None = None,
         exclude_mental_models: bool = False,
         exclude_mental_model_ids: list[str] | None = None,
+        reflect_search_observations_max_tokens: int | None = None,
+        reflect_search_observations_include_entities: bool | None = None,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories (sync wrapper — prefer :meth:`areflect` in async code).
@@ -749,6 +751,11 @@ class Hindsight:
             fact_types: Optional list of fact types to include (world, experience, observation).
             exclude_mental_models: If True, exclude all mental models from reflection (default: False).
             exclude_mental_model_ids: Optional list of specific mental model IDs to exclude.
+            reflect_search_observations_max_tokens: Token budget for the agent's search_observations
+                calls. None uses the bank's reflect_default_options, then the shipped default.
+            reflect_search_observations_include_entities: Whether search_observations attaches
+                resolved entity names, which can be over half the tool payload. None uses the
+                bank default (enabled).
 
         Returns:
             ReflectResponse with answer text, optionally facts used, optionally a 'trace' with
@@ -773,6 +780,8 @@ class Hindsight:
                 fact_types=fact_types,
                 exclude_mental_models=exclude_mental_models,
                 exclude_mental_model_ids=exclude_mental_model_ids,
+                reflect_search_observations_max_tokens=reflect_search_observations_max_tokens,
+                reflect_search_observations_include_entities=reflect_search_observations_include_entities,
             )
         )
 
@@ -782,6 +791,9 @@ class Hindsight:
         type: str | None = None,
         search_query: str | None = None,
         entity_id: str | None = None,
+        time_field: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> ListMemoryUnitsResponse:
@@ -796,6 +808,9 @@ class Hindsight:
                 type=type,
                 search_query=search_query,
                 entity_id=entity_id,
+                time_field=time_field,
+                start_date=start_date,
+                end_date=end_date,
                 limit=limit,
                 offset=offset,
             )
@@ -807,6 +822,9 @@ class Hindsight:
         type: str | None = None,
         search_query: str | None = None,
         entity_id: str | None = None,
+        time_field: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> ListMemoryUnitsResponse:
@@ -814,12 +832,22 @@ class Hindsight:
 
         entity_id: filter to memory units linked to this entity ID (stored links,
         not text/semantic match).
+
+        time_field / start_date / end_date are one time window: the named axis
+        (created_at, updated_at, mentioned_at, occurred_start, occurred_end) both
+        filters and orders the results, over the half-open range
+        ``[start_date, end_date)`` given as ISO-8601 strings. Memories carrying no
+        value on that axis are excluded, so ``total`` counts the window rather than
+        the bank.
         """
         return await self._memory_api.list_memories(
             bank_id=bank_id,
             type=type,
             q=search_query,
             entity_id=entity_id,
+            time_field=time_field,
+            start_date=start_date,
+            end_date=end_date,
             limit=limit,
             offset=offset,
             _request_timeout=self._timeout,
@@ -1383,6 +1411,8 @@ class Hindsight:
         fact_types: list[str] | None = None,
         exclude_mental_models: bool = False,
         exclude_mental_model_ids: list[str] | None = None,
+        reflect_search_observations_max_tokens: int | None = None,
+        reflect_search_observations_include_entities: bool | None = None,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories (async — preferred over :meth:`reflect`).
@@ -1415,6 +1445,11 @@ class Hindsight:
             fact_types: Optional list of fact types to include (world, experience, observation).
             exclude_mental_models: If True, exclude all mental models from reflection (default: False).
             exclude_mental_model_ids: Optional list of specific mental model IDs to exclude.
+            reflect_search_observations_max_tokens: Token budget for the agent's search_observations
+                calls. None uses the bank's reflect_default_options, then the shipped default.
+            reflect_search_observations_include_entities: Whether search_observations attaches
+                resolved entity names, which can be over half the tool payload. None uses the
+                bank default (enabled).
 
         Returns:
             ReflectResponse with answer text, optionally facts used, optionally a 'trace' with
@@ -1453,6 +1488,8 @@ class Hindsight:
             fact_types=fact_types,
             exclude_mental_models=exclude_mental_models or None,
             exclude_mental_model_ids=exclude_mental_model_ids,
+            reflect_search_observations_max_tokens=reflect_search_observations_max_tokens,
+            reflect_search_observations_include_entities=reflect_search_observations_include_entities,
         )
 
         return await _retry_on_capacity(
@@ -2341,6 +2378,72 @@ class Hindsight:
         )
         return submission.operation_id
 
+    def clone_bank(
+        self,
+        bank_id: str,
+        target_bank_id: str,
+        *,
+        include_data: bool = True,
+        include_bank_config: bool = True,
+        include_history: bool = False,
+    ) -> str:
+        """
+        Copy a bank into a new one (blocking convenience).
+
+        See :meth:`aclone_bank` for the full argument documentation.
+        """
+        return _run_async(
+            self.aclone_bank(
+                bank_id,
+                target_bank_id,
+                include_data=include_data,
+                include_bank_config=include_bank_config,
+                include_history=include_history,
+            )
+        )
+
+    async def aclone_bank(
+        self,
+        bank_id: str,
+        target_bank_id: str,
+        *,
+        include_data: bool = True,
+        include_bank_config: bool = True,
+        include_history: bool = False,
+    ) -> str:
+        """
+        Copy a bank into a new one, and return the clone operation's id.
+
+        The clone starts with the source's memories as they are at clone time and
+        evolves independently from then on. It runs server-side as the export and
+        import back to back, so no archive travels over the wire and no LLM is
+        called; poll ``client.operations.get_operation_status(bank_id, ...)`` for
+        progress and the per-component counts.
+
+        ``target_bank_id`` must NOT already exist. Note that webhooks travel with
+        ``include_bank_config``: a clone made with the defaults will call the
+        source's webhook endpoints.
+
+        Args:
+            bank_id: Bank to copy. The operation is recorded against it.
+            target_bank_id: Bank to create; must not already exist.
+            include_data: Copy the memories and everything backing them.
+            include_bank_config: Copy bank config, mental models, directives, webhooks.
+            include_history: Copy audit_log and llm_requests.
+
+        Returns:
+            The operation id of the background clone.
+        """
+        submission = await self._bank_transfer_api.clone_bank(
+            bank_id,
+            target_bank_id,
+            include_data=include_data,
+            include_bank_config=include_bank_config,
+            include_history=include_history,
+            _request_timeout=self._timeout,
+        )
+        return submission.operation_id
+
     async def _download_operation_archive(
         self,
         bank_id: str,
@@ -2658,6 +2761,7 @@ class Hindsight:
         consolidation_max_memories_per_round: int | None = None,
         mental_model_min_refresh_interval_seconds: int | None = None,
         knowledge_page_default_trigger: dict[str, Any] | None = None,
+        reflect_default_options: dict[str, Any] | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2721,6 +2825,7 @@ class Hindsight:
                 consolidation_max_memories_per_round=consolidation_max_memories_per_round,
                 mental_model_min_refresh_interval_seconds=mental_model_min_refresh_interval_seconds,
                 knowledge_page_default_trigger=knowledge_page_default_trigger,
+                reflect_default_options=reflect_default_options,
                 enable_text_search=enable_text_search,
                 enable_temporal_retrieval=enable_temporal_retrieval,
                 enable_graph_retrieval=enable_graph_retrieval,
@@ -2781,6 +2886,7 @@ class Hindsight:
         consolidation_max_memories_per_round: int | None = None,
         mental_model_min_refresh_interval_seconds: int | None = None,
         knowledge_page_default_trigger: dict[str, Any] | None = None,
+        reflect_default_options: dict[str, Any] | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2850,6 +2956,10 @@ class Hindsight:
             consolidation_llm_parallelism: Concurrent LLM calls during consolidation.
             consolidation_max_memories_per_round: Memories consolidated per round.
             mental_model_min_refresh_interval_seconds: Debounce between mental-model refreshes.
+            reflect_default_options: Default reflect options for this bank, applied whenever a
+                reflect request (or a mental model's trigger) leaves the option unset:
+                reflect_search_observations_max_tokens and
+                reflect_search_observations_include_entities.
             knowledge_page_default_trigger: Trigger fields merged over the built-in default for new
                 knowledge pages, e.g. {"refresh_cron": "0 * * * *"}.
             enable_observations: Toggle automatic observation consolidation after retain().
@@ -2914,6 +3024,7 @@ class Hindsight:
                 "consolidation_max_memories_per_round": consolidation_max_memories_per_round,
                 "mental_model_min_refresh_interval_seconds": mental_model_min_refresh_interval_seconds,
                 "knowledge_page_default_trigger": knowledge_page_default_trigger,
+                "reflect_default_options": reflect_default_options,
                 "enable_text_search": enable_text_search,
                 "enable_temporal_retrieval": enable_temporal_retrieval,
                 "enable_graph_retrieval": enable_graph_retrieval,
