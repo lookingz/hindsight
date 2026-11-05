@@ -51,6 +51,12 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'developer/decision-models',
+          label: 'Decision Models',
+          customProps: { icon: 'lu-network' },
+        },
+        {
+          type: 'doc',
           id: 'developer/multilingual',
           label: 'Multilingual',
           customProps: { icon: 'lu-languages' },
@@ -217,15 +223,34 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'Hosting',
+      label: 'Cloud & Enterprise',
       collapsible: false,
       items: [
         {
-          type: 'link',
-          href: 'https://ui.hindsight.vectorize.io/signup',
-          label: 'Cloud',
-          customProps: { icon: 'lu-cloud', iconAfter: 'lu-arrow-up-right' },
+          type: 'doc',
+          id: 'cloud-enterprise/overview',
+          label: 'Overview',
+          customProps: { icon: 'lu-compare' },
         },
+        {
+          type: 'doc',
+          id: 'cloud-enterprise/hindsight-cloud',
+          label: 'Hindsight Cloud',
+          customProps: { icon: 'lu-cloud' },
+        },
+        {
+          type: 'doc',
+          id: 'cloud-enterprise/enterprise',
+          label: 'Enterprise',
+          customProps: { icon: 'lu-server' },
+        },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Hosting',
+      collapsible: false,
+      items: [
         {
           type: 'doc',
           id: 'developer/installation',

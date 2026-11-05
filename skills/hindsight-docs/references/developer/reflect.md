@@ -4,23 +4,20 @@
 
 When you call `reflect()`, Hindsight runs an **agentic loop** that autonomously gathers evidence and reasons through the lens of the bank's disposition to generate contextual responses.
 
-```mermaid
-graph TB
-    subgraph agent["Reflect Agent Loop"]
-        A[Query] --> B{Need more info?}
-        B -->|Yes| C[Call Tools]
-        C --> D[search_mental_models]
-        C --> E[search_observations]
-        C --> F[recall]
-        C --> G[expand]
-        D --> B
-        E --> B
-        F --> B
-        G --> B
-        B -->|No| H[Generate Response]
-    end
-    H --> I[Response + Citations]
-```
+**Figure: Reflect Agent Loop.** An animated diagram on the docs site; its narration, step by step:
+
+- **reflect()**
+  1. reflect() gets a question that needs reasoning, not just lookup.
+  2. The bank’s mission, disposition and directives go into the agent’s instructions before it looks anything up.
+  3. Each turn is one tool call. Retrieval starts at the top, with mental models: curated summaries kept up to date.
+  4. A fresh mental model can be enough to answer. This one covers the team, not the ML project, so the agent keeps looking.
+  5. Then observations: beliefs consolidated from many facts.
+  6. The result is flagged stale: the bank has facts not yet consolidated into observations. So the agent must check the raw facts.
+  7. recall() runs the full four-way search over raw facts: the ground truth.
+  8. The newer fact is what the stale observation was missing: Alice asked to move to ML herself.
+  9. recall already returns the chunk each fact came from. expand goes further: the whole source document, for the full context.
+  10. The agent calls done. Every cited ID is checked against what it actually retrieved; anything else is dropped. It must gather evidence first, and stops after 10 iterations at most.
+  11. The answer follows the directives and the bank’s disposition, and comes back with the memories it is based on.
 
 ---
 
@@ -40,7 +37,8 @@ The reflect agent runs in a loop with access to these tools:
 
 | Tool | Purpose | Priority |
 |------|---------|----------|
-| `search_mental_models` | User-curated summaries | Highest (check first) |
+| `search_mental_models` | User-curated summaries — best matches in full up to a token budget, a snippet of the others | Highest (check first) |
+| `read_mental_models` | Full text of the pages returned as snippets | When a snippet looks relevant |
 | `search_observations` | Consolidated knowledge | High |
 | `recall` | Raw facts (ground truth) | Fallback |
 | `expand` | Get more context for a memory | As needed |
@@ -62,6 +60,19 @@ The agent uses a smart retrieval hierarchy:
 **Mental models** are saved reflect responses that you create for frequently asked questions. They're checked first because they represent explicitly curated knowledge. See the [Mental Models API](api/mental-models.md) for how to create and manage them.
 
 If an observation is marked as **stale**, the agent automatically verifies it against current facts.
+
+### Decision-Model Orchestration {#decision-model-orchestration}
+
+When a [decision model](./decision-models.md) is set up for reflect, the loop above changes shape to spend fewer LLM calls:
+
+1. One LLM call rewrites the request into a search query.
+2. All retrieval layers — mental models, observations, raw facts — run **in parallel** with that query.
+3. The decision model prunes the evidence to what matters and judges whether it already answers the request.
+4. If it does, the next LLM call writes the answer. If not, the LLM writes the next query and another parallel round runs, judged the same way.
+
+In agent mode each layer costs its own LLM turn; here one round covers them all.
+
+If the decision model fails, the LLM decides when to stop, as in agent mode, so the reflect still answers. Only the `hindsight` and `typesafe` providers are supported for now: with another provider reflect keeps agent turns and logs a warning. Turn it off for one bank with [`reflect_use_decision_model: false`](configuration.md#reflect).
 
 ---
 
@@ -313,7 +324,7 @@ Disposition creates **consistent character** across conversations while observat
 
 ## Next Steps
 
-- [**Observations**](./observations) — How knowledge is consolidated
-- [**Retain**](./retain) — How rich facts are stored
-- [**Recall**](./retrieval) — How multi-strategy search works
-- [**Reflect API**](./api/reflect) — Code examples and parameters
+- [**Observations**](./observations.md) — How knowledge is consolidated
+- [**Retain**](./retain.md) — How rich facts are stored
+- [**Recall**](./retrieval.md) — How multi-strategy search works
+- [**Reflect API**](./api/reflect.md) — Code examples and parameters

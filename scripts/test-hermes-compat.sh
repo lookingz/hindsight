@@ -1,47 +1,53 @@
 #!/usr/bin/env bash
 #
-# Compatibility gate: hermes-agent @ main + the Hindsight stack in THIS checkout.
+# Compatibility gate: hermes-agent @ main + THIS checkout's Hindsight plugin,
+# installed the way a Hermes user installs it.
 #
-# Why this exists (see #3251):
+# Every step goes through Hermes' own user-facing path, so the job breaks only
+# where a user would break:
 #
-# Hermes exact-pins every direct dependency (`==X.Y.Z`) as a deliberate
-# supply-chain policy — they will not loosen a pin to accommodate us. Hindsight
-# is installed *into Hermes' own venv* by `hermes memory setup` in
-# `local_embedded` mode (the wizard installs `hindsight-all`), so any version
-# range we declare that excludes one of their pins makes the pair impossible to
-# co-install. #3251 was exactly that: our `cryptography>=48.0.1` / `pillow>=12.3.0`
-# floors against their `==46.0.7` / `==12.2.0`, leaving `pip check` permanently
-# broken for every Hermes user on embedded memory.
+#   1. Install   — Hermes' installer (scripts/install.sh). Its package manager
+#                  builds the venv from Hermes' uv.lock with Hermes' overrides
+#                  and runs its own `uv pip check`. (#5974 was this script
+#                  resolving Hermes by hand and skipping those overrides.)
+#   2. Plugin    — `hermes plugins install hindsight`, by catalog name: clone,
+#                  security scan, dependency resolution against Hermes' pins,
+#                  enable as memory.provider. Then `hermes plugins validate`, the
+#                  catalog admission gate.
+#   3. Wiring    — configure local_embedded and check `hermes memory status`.
+#   4. Upgrade   — `hermes update` to a new Hermes commit; the plugin and its
+#                  dependencies must survive the venv rebuild.
+#   5. Provider  — load the provider through Hermes' registry and round-trip a
+#                  turn (auto-retain, auto-recall, tools). This boots the
+#                  embedded daemon the way the plugin does for users: `uvx
+#                  hindsight-api@<embed version>` in its own environment.
 #
-# That class of breakage is structural and recurring — both sides bump on their
-# own schedule — so it needs a build gate, not a one-off fix. This script tracks
-# Hermes' *main* branch rather than a PyPI release so the conflict surfaces here
-# while it is still cheap to fix, instead of in a released Hermes.
+# The one patch: the catalog entry for `hindsight` pins a published commit of
+# this repo. We rewrite it in the Hermes checkout to point at a git snapshot of
+# this working tree's plugin (file:// — the catalog normally accepts https only,
+# so that check is relaxed too), and commit it before installing so `hermes
+# update` keeps it. Everything else is unmodified Hermes.
 #
-# What it verifies, in order of increasing depth:
-#   1. Resolution   — Hermes @ main and this checkout's Hindsight co-resolve.
-#   2. pip check    — the resulting environment is internally consistent.
-#   3. Wiring       — `hermes memory status` sees Hindsight in local_embedded mode.
-#   4. Runtime      — the modules Hermes imports for embedded memory import cleanly.
-#   5. Embedded     — the daemon actually boots under Hermes' pinned dependency
-#                     set and serves bank operations.
+# What this does NOT test: this checkout's hindsight-api / -embed / -client. The
+# plugin declares `hindsight-client` and `hindsight-embed` from PyPI (with upper
+# bounds), and Hermes users get exactly those releases, so this job does too.
 #
-# Step 5 boots a real embedded daemon (pg0 + local embedding models), which is
-# the only way to prove the co-installed dependency set can actually *run*
-# Hindsight rather than merely import it. The daemon refuses to construct a
-# MemoryEngine without an LLM key, so it boots on a placeholder one — nothing
-# calls the LLM during startup or bank operations.
+# Previously this script built every Hindsight distribution from the working
+# tree and resolved them together with an editable Hermes in one `uv pip
+# install` (the #3251 co-install gate, from when the setup wizard put
+# hindsight-all into Hermes' venv). That stopped matching reality twice over:
+# Hermes no longer installs hindsight-all (the daemon runs under uvx in its own
+# environment), and a hand-rolled resolve skips Hermes' [tool.uv] overrides, so
+# an upstream pin clash its own installer handles turned every PR red (#5974).
 #
-# A retain/recall round-trip does need a working LLM, so that part runs only
-# when HERMES_COMPAT_LLM_API_KEY is set (with HERMES_COMPAT_LLM_PROVIDER /
-# _MODEL selecting the backend). Without a key all five steps still run — only
-# the round-trip is skipped, and the script says so.
+# The retain/recall round-trip needs a working LLM, so it runs only when
+# HERMES_COMPAT_LLM_API_KEY is set (HERMES_COMPAT_LLM_PROVIDER / _MODEL pick the
+# backend). Without a key every other step still runs.
 #
 # Usage: scripts/test-hermes-compat.sh [--keep] [--hermes-ref BRANCH_OR_TAG]
 #
 #   --keep         leave the temporary work dir in place for inspection
-#   --hermes-ref   Hermes branch or tag to test against (default: main). A bare
-#                  commit SHA will not work — the clone is --depth 1.
+#   --hermes-ref   Hermes branch or tag to test against (default: main)
 
 set -euo pipefail
 
@@ -57,34 +63,47 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# pg0's initdb refuses to run as root by design, and Hermes' own plugin bails
-# out of local_embedded mode when it detects euid 0. Fail loudly here rather
-# than let step 5 die deep inside the daemon with an opaque error.
+# pg0's initdb refuses to run as root by design, and the plugin bails out of
+# local_embedded mode when it detects euid 0.
 if [ "$(id -u)" = "0" ]; then
     echo "ERROR: this script boots an embedded PostgreSQL and cannot run as root." >&2
-    echo "       Run it as an unprivileged user (GitHub's ubuntu runners already are)." >&2
     exit 1
 fi
 
 WORKDIR="$(mktemp -d)"
+export HERMES_HOME="$WORKDIR/hermes-home"
+export HERMES_COMPAT_PROFILE="hermes-ci"
+# Hermes' installer and updater edit shell rc files and ~/.local/bin; give them
+# a throwaway HOME so a local run leaves the developer's machine alone. Every
+# other command keeps the real HOME, so the daemon reuses the uv / HuggingFace
+# caches and its logs land where the CI failure step looks
+# (~/.hindsight/profiles/hermes-ci*). The "hermes-ci" profile keeps it clear of
+# a developer's real "hermes" profile.
+INSTALL_HOME="$WORKDIR/home"
+mkdir -p "$INSTALL_HOME"
+HERMES_SRC="$WORKDIR/hermes-src"
+INSTALL_DIR="$HERMES_HOME/hermes-agent"
+HERMES="$INSTALL_DIR/.hermes/bin/hermes"
+GIT=(git -c user.name=hermes-compat -c user.email=hermes-compat@localhost)
+
+# The venv Hermes is running right now. Its package manager replaces the venv
+# on every dependency change (plugin install, update), so always re-read it.
+hermes_python() {
+    python3 - "$HERMES_HOME" <<'PYVENV'
+import glob, json, sys
+(facts,) = glob.glob(f"{sys.argv[1]}/installs/*/facts.json")
+print(json.load(open(facts))["packages"]["venv"]["environment"] + "/bin/python")
+PYVENV
+}
+
 cleanup() {
     local status=$?
-    # Step 5 runs from inside the work dir; step out before removing it.
     cd / || true
-    # Best-effort daemon stop so a failed run doesn't strand a pg0 instance
-    # holding the profile's data directory.
-    if [ -n "${VENV_PY:-}" ] && [ -x "${VENV_PY:-}" ]; then
-        # Failures are reported, not swallowed: a silent `except: pass` here
-        # would turn a typo in the import into a teardown that never runs and
-        # leaves the daemon up with nobody the wiser.
-        "$VENV_PY" - <<'PYSTOP' || echo "  (daemon stop failed; it may still be running)" >&2
+    # Best-effort daemon stop so a failed run doesn't strand a pg0 instance.
+    if [ -x "$HERMES" ]; then
+        "$(hermes_python)" - <<'PYSTOP' || echo "  (daemon stop failed; it may still be running)" >&2
 import os
-import sys
-
-try:
-    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
-except ImportError as exc:  # install step failed before the venv was usable
-    sys.exit(f"cleanup: {exc}")
+from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
 
 DaemonEmbedManager().stop(os.environ.get("HERMES_COMPAT_PROFILE", "hermes-ci"))
 PYSTOP
@@ -98,22 +117,6 @@ PYSTOP
 }
 trap cleanup EXIT
 
-# Hermes state goes in a throwaway dir via its documented override.
-#
-# Hindsight state is isolated by *profile* rather than by redirecting HOME: the
-# embedded daemon keys both its profile env (~/.hindsight/profiles/<profile>.env)
-# and its pg0 data directory (~/.pg0/instances/hindsight-embed-<profile>) on the
-# profile name, so a dedicated "hermes-ci" profile cannot collide with a
-# developer's real "hermes" profile. Redirecting HOME would isolate those too,
-# but it would also hide the uv and HuggingFace caches from the runner and make
-# CI re-download the whole local-ml stack (torch et al.) on every run.
-export HERMES_HOME="$WORKDIR/hermes-home"
-export HERMES_COMPAT_PROFILE="hermes-ci"
-mkdir -p "$HERMES_HOME"
-
-VENV="$WORKDIR/venv"
-VENV_PY="$VENV/bin/python"
-
 echo "=== Hermes ↔ Hindsight compatibility test ==="
 echo "  Hermes ref:   $HERMES_REF"
 echo "  Hindsight:    $REPO_ROOT (working tree)"
@@ -121,134 +124,141 @@ echo "  Work dir:     $WORKDIR"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1. Resolution — the #3251 gate
+# 0. Sources — a Hermes checkout with the catalog patched, and a plugin snapshot
 # ---------------------------------------------------------------------------
-# Everything goes into ONE resolution on purpose. Installing Hermes first and
-# Hindsight second would let the second install silently downgrade a Hermes pin
-# and report success; resolved together, an unsatisfiable pin is a hard error.
-#
-# The Hindsight distributions are built into wheels from this checkout and
-# installed from those, so the gate tests the branch under review.
-#
-# Wheels, NOT `file://` directory requirements: uv installs a workspace member
-# given as a directory in a way that leaves `hindsight_embed.__file__` pointing
-# back at the source tree. The embedded daemon manager keys dev-mode detection on
-# that path (`__file__/../../../hindsight-api-slim`), so a directory install makes
-# it launch the API via `uv run --project <repo>/hindsight-api-slim` — i.e. out of
-# the *monorepo's* venv, with the monorepo's dependency set and .env, completely
-# bypassing the Hermes venv this script exists to test. Wheels land in
-# site-packages, dev mode stays off, and step 5 exercises the real thing. The
-# assertion in step 5 keeps it that way.
-#
-# Hermes must be a *source clone + editable* install: its build backend raises
-# "Building wheels or sdists for hermes-agent is not supported" on purpose, so a
-# plain `git+https://...` requirement fails at the wheel-build step. Editable is
-# the path their own docs point developers at. It also puts the repo's
-# `plugins/` tree on sys.path, which is where the Hindsight memory plugin lives.
-echo "--- [1/5] Resolving hermes-agent@$HERMES_REF + local Hindsight stack ---"
-HERMES_SRC="$WORKDIR/hermes-agent"
-# Use the runner token when available to avoid the low unauthenticated limit on
-# shared CI runner IPs. Environment-based Git config is ephemeral: it is not
-# visible in the command line and is not persisted in the cloned repository.
-# stdout is silenced but stderr is not: a clone that fails on a network blip
-# should say why rather than surface as an opaque failure in the next command.
+echo "--- [0/5] Preparing Hermes@$HERMES_REF and a snapshot of this plugin ---"
+# `git clone` gets rate-limited on shared CI runner IPs; retry with the token.
 clone_ok=0
 for attempt in 1 2 3; do
-    if [ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]; then
-        token="${GITHUB_TOKEN:-${GH_TOKEN}}"
-        GIT_CONFIG_COUNT=1 \
-        GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
-        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')" \
-        git clone --depth 1 --branch "$HERMES_REF" \
-            https://github.com/NousResearch/hermes-agent.git "$HERMES_SRC" >/dev/null && clone_ok=1
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')" \
+            git clone -q --depth 1 --branch "$HERMES_REF" \
+            https://github.com/NousResearch/hermes-agent.git "$HERMES_SRC" && clone_ok=1
     else
-        git clone --depth 1 --branch "$HERMES_REF" \
-            https://github.com/NousResearch/hermes-agent.git "$HERMES_SRC" >/dev/null && clone_ok=1
+        git clone -q --depth 1 --branch "$HERMES_REF" \
+            https://github.com/NousResearch/hermes-agent.git "$HERMES_SRC" && clone_ok=1
     fi
-    [ "$clone_ok" -eq 1 ] && break
+    [ "$clone_ok" = "1" ] && break
     rm -rf "$HERMES_SRC"
-    if [ "$attempt" -lt 3 ]; then
-        delay=$((5 * 3 ** (attempt - 1)))
-        echo "    clone failed (attempt $attempt/3); retrying in ${delay}s..." >&2
-        sleep "$delay"
-    fi
+    sleep $((attempt * 10))
 done
-if [ "$clone_ok" -ne 1 ]; then
+if [ "$clone_ok" != "1" ]; then
     echo "ERROR: could not clone hermes-agent after 3 attempts." >&2
     exit 1
 fi
-echo "    hermes-agent @ $(git -C "$HERMES_SRC" rev-parse --short HEAD)"
+UPSTREAM_SHA="$(git -C "$HERMES_SRC" rev-parse --short HEAD)"
+echo "    hermes-agent @ $UPSTREAM_SHA"
+# The installer clones from this repo, and git refuses to clone from a shallow
+# one, so restart history at a single commit. --no-verify: Hermes' own hooks
+# are not ours to run. The branch must be `main`: `hermes update` follows the
+# main channel for a non-official origin, whatever ref was installed.
+rm -rf "$HERMES_SRC/.git"
+git -C "$HERMES_SRC" init -q -b main
+git -C "$HERMES_SRC" add -A
+"${GIT[@]}" -C "$HERMES_SRC" commit -q --no-verify -m "hermes-agent@$UPSTREAM_SHA"
 
-# Pinned rather than taken from .python-version: Hermes caps itself at
-# `>=3.11,<3.14` (their Rust-backed transitives have no cp314 wheels), so this
-# venv has to sit inside both projects' windows. 3.12 does; the repo default
-# would silently stop doing so the day Hindsight moves to 3.14.
-uv venv --python 3.12 "$VENV" >/dev/null
+# Snapshot the working tree's plugin (tracked + new files, as they are on disk)
+# into its own repo, laid out like this one so the catalog subdir still applies.
+PLUGIN_REPO="$WORKDIR/plugin-repo"
+mkdir -p "$PLUGIN_REPO"
+(cd "$REPO_ROOT" && git ls-files -z --cached --others --exclude-standard hindsight-integrations/hermes \
+    | xargs -0 tar cf -) | tar xf - -C "$PLUGIN_REPO"
+git -C "$PLUGIN_REPO" init -q -b main
+git -C "$PLUGIN_REPO" add -A
+"${GIT[@]}" -C "$PLUGIN_REPO" commit -q -m "hindsight plugin under test"
+PLUGIN_SHA="$(git -C "$PLUGIN_REPO" rev-parse HEAD)"
 
-DIST="$WORKDIR/dist"
-for project in hindsight-api-slim hindsight-clients/python hindsight-embed hindsight-all; do
-    uv build --wheel -q -o "$DIST" "$REPO_ROOT/$project"
-done
-echo "    built $(find "$DIST" -name '*.whl' | wc -l | tr -d ' ') wheels from the working tree"
+python3 - "$HERMES_SRC" "file://$PLUGIN_REPO" "$PLUGIN_SHA" <<'PYPATCH'
+import re, sys
+from pathlib import Path
 
-# hindsight-all depends on hindsight-api-slim[all], so the extras come along
-# without naming them here; the sibling wheels satisfy its exact-version pins.
-# shellcheck disable=SC2046 # deliberate word splitting over the wheel list
-uv pip install --python "$VENV_PY" \
-    -e "$HERMES_SRC" \
-    $(find "$DIST" -name '*.whl')
+src, repo, sha = sys.argv[1:]
 
-echo "✓ Resolved and installed together"
+def patch(path, pattern, repl):
+    p = Path(src, path)
+    text, n = re.subn(pattern, repl, p.read_text())
+    # Hermes moved or rewrote the code this relies on: fail here, by name.
+    assert n == 1, f"{path}: expected one match for {pattern!r}, found {n}"
+    p.write_text(text)
+
+patch("plugin-catalog/hindsight.yaml", r"(?m)^repo: .*$", f"repo: {repo}")
+patch("plugin-catalog/hindsight.yaml", r"(?m)^sha: .*$", f"sha: {sha}")
+patch("hermes_cli/plugin_catalog.py", r'not repo\.startswith\("https://"\)',
+      'not repo.startswith(("https://", "file://"))')
+PYPATCH
+"${GIT[@]}" -C "$HERMES_SRC" commit -q --no-verify -am "ci: point the hindsight catalog entry at the plugin under test"
+echo "✓ catalog entry 'hindsight' -> plugin snapshot ${PLUGIN_SHA:0:12}"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 2. pip check — the exact symptom users reported in #3251
+# 1. Install — Hermes' own installer
 # ---------------------------------------------------------------------------
-echo "--- [2/5] Verifying environment consistency ---"
-uv pip check --python "$VENV_PY"
+echo "--- [1/5] Installing Hermes with its installer ---"
+HOME="$INSTALL_HOME" HERMES_REPO_URL="file://$HERMES_SRC" \
+    bash "$HERMES_SRC/scripts/install.sh" --non-interactive --branch main \
+    --dir "$INSTALL_DIR" --skip-browser --skip-computer-use 2>&1 | sed 's/^/    /'
+[ -x "$HERMES" ] || { echo "ERROR: installer finished without $HERMES" >&2; exit 1; }
+echo "✓ Hermes installed"
+echo ""
 
-# Surface the versions of the packages this has historically broken on, so a
-# CI log shows *which* side won each contested pin without a re-run.
-"$VENV_PY" - <<'PYVER'
-from importlib.metadata import version, PackageNotFoundError
+# Run from the work dir: hindsight_api force-loads a .env discovered from the
+# working directory, and a developer's repo .env would hand the daemon
+# credentials CI does not have.
+cd "$WORKDIR"
 
-for name in ("hermes-agent", "hindsight-api-slim", "hindsight-embed", "hindsight-client",
-             "cryptography", "pillow", "protobuf", "opentelemetry-sdk", "pydantic", "openai"):
-    try:
-        print(f"    {name:22} {version(name)}")
-    except PackageNotFoundError:
-        print(f"    {name:22} (not installed)")
-PYVER
-echo "✓ Environment is internally consistent"
+# ---------------------------------------------------------------------------
+# 2. Plugin — `hermes plugins install hindsight`, by catalog name
+# ---------------------------------------------------------------------------
+echo "--- [2/5] Installing the Hindsight plugin from the catalog ---"
+"$HERMES" plugins install hindsight --enable --yes-deps 2>&1 | sed 's/^/    /'
+
+PLUGIN_DIR="$HERMES_HOME/plugins/hindsight"
+check_plugin() {
+    "$(hermes_python)" - "$PLUGIN_DIR" "$PLUGIN_SHA" <<'PYPLUGIN'
+import json, sys
+from importlib.metadata import version
+from pathlib import Path
+
+from plugins.memory import find_provider_dir
+
+plugin_dir, sha = Path(sys.argv[1]), sys.argv[2]
+# The install record must name our snapshot: a live catalog that won over the
+# patched in-tree one would have installed the published commit instead.
+record = json.loads((plugin_dir / ".hermes-catalog.json").read_text())
+assert record.get("sha") == sha, f"installed {record}, not the snapshot {sha}"
+resolved = find_provider_dir("hindsight")
+assert resolved and Path(resolved).resolve() == plugin_dir.resolve(), (
+    f"Hermes resolves 'hindsight' to {resolved}, not {plugin_dir}"
+)
+print(f"    ✓ provider is the plugin under test ({sha[:12]})")
+for name in ("hindsight-client", "hindsight-embed", "pillow", "cryptography"):
+    print(f"    {name:18} {version(name)}")
+PYPLUGIN
+}
+check_plugin
+"$HERMES" plugins validate "$PLUGIN_DIR" 2>&1 | sed 's/^/    /'
+echo "✓ Plugin installed through the catalog and passes Hermes' admission checks"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3. Wiring — configure embedded mode the way `hermes memory setup` does
+# 3. Wiring — local_embedded, the way `hermes memory setup` leaves it
 # ---------------------------------------------------------------------------
-# `hermes memory setup` is a curses wizard and cannot be driven headlessly, so
-# we write the same two artifacts it writes: the provider selection in
-# config.yaml and the Hindsight provider config under $HERMES_HOME. Keep this in
-# sync with plugins/memory/hindsight/__init__.py::post_setup if Hermes changes
-# the shape.
-#
-# memory_enabled/user_profile_enabled are the flags our docs tell users to set
-# so Hindsight is the only memory path (they silence the built-in MEMORY.md and
-# USER.md stores). They are set here so the status assertion below covers the
-# configuration we actually document: turning the flat-file stores off must not
-# take the Hindsight provider down with it.
+# `hermes memory setup` is an interactive wizard, so write what it writes: the
+# plugin's config.json. `plugins install --enable` already set memory.provider.
+# memory_enabled/user_profile_enabled off is the setup our docs recommend (only
+# Hindsight remembers); it must not take the provider down with it.
+# A bank per run: the profile's pg0 data survives between local runs, and a bank
+# still holding the last run's turn would let step 5's recall pass on old data.
 echo "--- [3/5] Configuring Hermes for local_embedded Hindsight ---"
+"$HERMES" config set memory.memory_enabled false >/dev/null
+"$HERMES" config set memory.user_profile_enabled false >/dev/null
 mkdir -p "$HERMES_HOME/hindsight"
-cat > "$HERMES_HOME/config.yaml" <<EOF
-memory:
-  provider: hindsight
-  memory_enabled: false
-  user_profile_enabled: false
-EOF
 cat > "$HERMES_HOME/hindsight/config.json" <<EOF
 {
   "mode": "local_embedded",
   "profile": "$HERMES_COMPAT_PROFILE",
-  "bank_id": "hermes-compat-ci",
+  "bank_id": "hermes-compat-ci-$(date +%s)",
   "llm_provider": "${HERMES_COMPAT_LLM_PROVIDER:-openai}",
   "llm_model": "${HERMES_COMPAT_LLM_MODEL:-gpt-4o-mini}",
   "llm_api_key": "${HERMES_COMPAT_LLM_API_KEY:-}",
@@ -256,150 +266,129 @@ cat > "$HERMES_HOME/hindsight/config.json" <<EOF
 }
 EOF
 
-# Hermes' own CLI must agree that Hindsight is the active provider and that its
-# plugin loaded — this catches plugin/config-shape drift that a pure import
-# check would sail straight past.
-#
-# Match the specific "Provider:" and "Status:" lines, not a bare "hindsight":
-# the command also prints every *installed* plugin, so a loose grep would pass
-# even with Hindsight inactive. Note this command reports the provider, not the
-# mode (it renders `memory.<provider>` from config.yaml, while the mode lives in
-# the plugin's own config.json) — step 5 is what proves local_embedded is live,
-# because only that mode starts a daemon.
-STATUS_OUT="$("$VENV/bin/hermes" memory status 2>&1)" || {
-    echo "$STATUS_OUT"
-    echo "ERROR: 'hermes memory status' failed" >&2
-    exit 1
+# Match the "Provider:" and "Status:" lines, not a bare "hindsight": the command
+# also lists every installed plugin.
+check_memory_status() {
+    local out
+    out="$("$HERMES" memory status 2>&1)" || { echo "$out"; echo "ERROR: 'hermes memory status' failed" >&2; exit 1; }
+    echo "$out" | sed 's/^/    /'
+    echo "$out" | grep -qE "^ *Provider: +hindsight *$" || {
+        echo "ERROR: 'hermes memory status' does not report hindsight as the active provider" >&2; exit 1; }
+    echo "$out" | grep -qE "^ *Status: +available" || {
+        echo "ERROR: Hermes reports the Hindsight plugin as unavailable" >&2; exit 1; }
 }
-echo "$STATUS_OUT" | sed 's/^/    /'
-echo "$STATUS_OUT" | grep -qE "^ *Provider: +hindsight *$" || {
-    echo "ERROR: 'hermes memory status' does not report hindsight as the active provider" >&2
-    exit 1
-}
-echo "$STATUS_OUT" | grep -qE "^ *Status: +available" || {
-    echo "ERROR: Hermes reports the Hindsight plugin as unavailable" >&2
-    exit 1
-}
+check_memory_status
 echo "✓ Hermes reports Hindsight as the active, available memory provider"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 4. Runtime probe
+# 4. Upgrade — `hermes update`
 # ---------------------------------------------------------------------------
-# Mirrors plugins/memory/hindsight/__init__.py::_check_local_runtime — the gate
-# Hermes itself runs before creating an embedded client. We import the same
-# three modules directly rather than calling their private helper so this does
-# not break when Hermes refactors internals. sentence_transformers is in the
-# list because the daemon computes embeddings through it: `hindsight` and
-# `hindsight_embed` can import fine while that stack is broken.
-echo "--- [4/5] Probing the embedded runtime imports ---"
-"$VENV_PY" - <<'PYPROBE'
-import importlib
-
-for mod in ("hindsight", "hindsight_embed.daemon_embed_manager", "sentence_transformers"):
-    importlib.import_module(mod)
-    print(f"    ✓ import {mod}")
-
-from hindsight import HindsightEmbedded  # noqa: F401
-print("    ✓ from hindsight import HindsightEmbedded")
-PYPROBE
-echo "✓ Embedded runtime imports cleanly under Hermes' pinned dependencies"
+# Give the update something to pull, so it runs the full path (fetch, fast-
+# forward, venv rebuild with enabled plugins) rather than "already up to date".
+echo "--- [4/5] Upgrading Hermes with 'hermes update' ---"
+"${GIT[@]}" -C "$HERMES_SRC" commit -q --no-verify --allow-empty -m "ci: next hermes commit"
+HOME="$INSTALL_HOME" "$HERMES" update --yes --no-backup --no-gateway-restart 2>&1 | sed 's/^/    /'
+[ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" = "$(git -C "$HERMES_SRC" rev-parse HEAD)" ] || {
+    echo "ERROR: 'hermes update' did not move the install to the new commit" >&2; exit 1; }
+check_plugin
+check_memory_status
+echo "✓ The plugin survives 'hermes update'"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Embedded daemon
+# 5. Provider — the plugin's own surface, driven the way Hermes drives it
 # ---------------------------------------------------------------------------
-# Constructs the client with the same kwargs Hermes passes in _get_client(),
-# boots the daemon, and exercises bank operations. Retain/recall need a real
-# LLM, so they are conditional; the daemon boot and bank round-trip are not,
-# which keeps this step meaningful on runs without credentials (fork PRs).
+# Loads the provider through Hermes' registry and calls the MemoryProvider
+# contract agent_init uses. The first call that needs memory boots the embedded
+# daemon through the plugin's own path.
 #
-# Run from the work dir, not the repo: hindsight_api's config force-loads a .env
-# discovered from the working directory, and a developer's repo .env would
-# otherwise hand the daemon credentials that CI does not have — making this pass
-# locally for a reason that does not exist on a runner.
-cd "$WORKDIR"
-echo "--- [5/5] Booting the embedded daemon ---"
-"$VENV_PY" - <<'PYEMBED'
+# Without an LLM key: boot on a placeholder key (the daemon refuses to start
+# with none; nothing below calls the LLM) and recall from the empty bank, which
+# proves the daemon runs. Exit 3 tells the caller the round-trip was skipped.
+#
+# recall_sync makes prefetch answer on this turn instead of the next one.
+echo "--- [5/5] Exercising the plugin's MemoryProvider surface ---"
+(set +e; "$(hermes_python)" - <<'PYPROVIDER'
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
-from hindsight import HindsightEmbedded
-from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+has_key = bool(os.environ.get("HERMES_COMPAT_LLM_API_KEY"))
+config_path = Path(os.environ["HERMES_HOME"]) / "hindsight" / "config.json"
+config = json.loads(config_path.read_text())
+config.update(recall_sync=True, retain_async=False)
+if not has_key:
+    config["llm_api_key"] = "hermes-compat-ci-placeholder-not-a-real-key"
+config_path.write_text(json.dumps(config))
 
-# Guard the whole point of this step: the daemon must run from the venv Hermes
-# shares, not from the monorepo. Dev-mode detection silently redirects it to
-# `uv run --project <repo>/hindsight-api-slim` whenever hindsight_embed resolves
-# to the source tree, which would test the monorepo's dependency set instead.
-api_cmd = DaemonEmbedManager()._find_api_command("0.0.0")
-venv_root = str(Path(sys.prefix).resolve())
-assert str(Path(api_cmd[0]).resolve()).startswith(venv_root), (
-    f"daemon would launch via {api_cmd!r}, outside the test venv ({venv_root}). "
-    "That runs Hindsight from the monorepo, not from Hermes' environment, so this "
-    "step would prove nothing. Install Hindsight from built wheels, not directories."
-)
-print(f"    ✓ daemon binary resolves inside the test venv ({Path(api_cmd[0]).name})")
+from plugins.memory import load_memory_provider
 
-profile = os.environ["HERMES_COMPAT_PROFILE"]
-api_key = os.environ.get("HERMES_COMPAT_LLM_API_KEY", "")
-provider = os.environ.get("HERMES_COMPAT_LLM_PROVIDER", "openai")
-model = os.environ.get("HERMES_COMPAT_LLM_MODEL", "gpt-4o-mini")
+provider = load_memory_provider("hindsight")
+assert provider is not None, "Hermes registry returned no 'hindsight' provider"
+print(f"    ✓ loaded {type(provider).__name__} from {type(provider).__module__}")
 
-# MemoryEngine refuses to construct without an LLM key, so the daemon cannot
-# boot at all without one. Booting is what proves the co-installed dependency
-# set can run Hindsight, and that is worth having on credential-less runs, so
-# feed a placeholder: nothing calls the LLM during startup or bank operations.
-# The retain/recall round-trip below stays gated on a real key.
-boot_key = api_key or "hermes-compat-ci-placeholder-not-a-real-key"
+assert provider.is_available(), f"provider reports unavailable: {provider.unavailable_reason()}"
+print("    ✓ is_available()")
 
-# Hermes maps these two onto the OpenAI wire format before handing them to the
-# daemon; mirror that so the profile env we produce matches its shape.
-daemon_provider = "openai" if provider in {"openai_compatible", "openrouter"} else provider
+provider.initialize(session_id="hermes-compat-ci")
+tools = {schema.get("name") for schema in provider.get_tool_schemas()}
+assert {"hindsight_retain", "hindsight_recall", "hindsight_reflect"} <= tools, f"missing tools: {tools}"
+print(f"    ✓ initialize() and {len(tools)} tools registered")
 
-client = HindsightEmbedded(
-    profile=profile,
-    llm_provider=daemon_provider,
-    llm_api_key=boot_key,
-    llm_model=model,
-    idle_timeout=0,
-)
-
-bank_id = "hermes-compat-ci"
 try:
-    client._ensure_started()
-    print("    ✓ daemon started")
+    if not has_key:
+        recalled = provider.handle_tool_call("hindsight_recall", {"query": "anything"})
+        # Tools answer {"result": ...} on success and {"error": ...} on failure.
+        assert "result" in json.loads(recalled), f"hindsight_recall failed: {recalled!r}"
+        print("    ✓ embedded daemon booted and answered hindsight_recall")
+        print("    ⓘ skipping the retain/recall round-trip — no HERMES_COMPAT_LLM_API_KEY set")
+        sys.exit(3)
 
-    # The pg0 data directory survives between runs (it is keyed on the profile),
-    # so a previously killed run can leave this bank behind. Drop it first to
-    # keep the script re-runnable rather than failing on a stale bank.
-    try:
-        client.delete_bank(bank_id)
-    except Exception:  # noqa: BLE001 - absent bank is the normal case
-        pass
+    # Auto-retain: what the post-turn hook calls on every exchange.
+    provider.sync_turn(
+        user_content="My name is Ada Lovelace and I only drink espresso.",
+        assistant_content="Noted, Ada.",
+        session_id="hermes-compat-ci",
+    )
+    print("    ✓ sync_turn() enqueued a turn")
 
-    client.create_bank(bank_id)
-    print(f"    ✓ created bank {bank_id!r}")
+    # Extraction is an LLM call; poll rather than sleep a fixed amount.
+    deadline, injected = time.time() + 180, ""
+    while time.time() < deadline:
+        time.sleep(5)
+        injected = provider.prefetch("What does the user drink?", session_id="hermes-compat-ci") or ""
+        if "espresso" in injected.lower():
+            break
+    assert "espresso" in injected.lower(), (
+        f"auto-recall never surfaced the retained turn within 180s; last injection: {injected!r}"
+    )
+    print("    ✓ prefetch() injected the retained memory")
 
-    if api_key:
-        client.retain(bank_id, "The user's favourite colour is blue.")
-        print("    ✓ retained a memory")
-        results = client.recall(bank_id, "What is the user's favourite colour?")
-        # Assert the call round-trips into a usable result rather than just
-        # returning; recall *quality* is not this script's business.
-        assert results is not None, "recall returned None"
-        print(f"    ✓ recalled ({type(results).__name__})")
-    else:
-        print("    ⓘ skipping retain/recall — no HERMES_COMPAT_LLM_API_KEY set")
-        print("      (daemon booted on a placeholder key; bank operations verified)")
+    status = provider.recall_status()
+    assert status is not None and status.count > 0, f"recall_status() reported nothing: {status}"
+    print(f"    ✓ recall_status() -> {status.count} memor(ies)")
+
+    recalled = provider.handle_tool_call("hindsight_recall", {"query": "What is the user's name?"})
+    assert "ada" in recalled.lower(), f"hindsight_recall did not find the name: {recalled!r}"
+    print("    ✓ hindsight_recall tool")
+
+    provider.on_session_end([{"role": "user", "content": "bye"}])
+    print("    ✓ on_session_end()")
 finally:
-    try:
-        client.delete_bank(bank_id)
-    except Exception as exc:  # noqa: BLE001 - teardown must not mask a real failure
-        print(f"    ⚠ bank cleanup failed: {exc}", file=sys.stderr)
-    client.close(stop_daemon=True)
-    print("    ✓ daemon stopped")
-PYEMBED
+    provider.shutdown()
+    print("    ✓ shutdown()")
+PYPROVIDER
+) && provider_status=0 || provider_status=$?
+if [ "$provider_status" = "0" ]; then
+    echo "✓ The plugin round-trips a turn through Hermes' MemoryProvider contract"
+elif [ "$provider_status" = "3" ]; then
+    echo "✓ The plugin boots the daemon and answers recall (round-trip skipped: no LLM key)"
+else
+    exit "$provider_status"
+fi
 
 echo ""
-echo "=== PASS: hermes-agent@$HERMES_REF is compatible with this Hindsight ==="
+echo "=== PASS: hermes-agent@$HERMES_REF ($UPSTREAM_SHA) works with this Hindsight plugin ==="

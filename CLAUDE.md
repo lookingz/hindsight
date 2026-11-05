@@ -73,7 +73,8 @@ cd hindsight-system-tests && uv run pytest tests/ -v
 
 ### Documentation Site (Docusaurus)
 ```bash
-./scripts/dev/start-docs.sh
+./scripts/dev/start-docs.sh          # pages compile on first visit (~1 GB)
+./scripts/dev/start-docs.sh --full   # compile every page up front, like the build (~3.5 GB)
 ```
 
 
@@ -119,28 +120,29 @@ uv run run-amb --dataset longmemeval --split s -- --category single-session-user
 - **hindsight-system-evals/**: End-to-end quality evaluation suites scored by independent LLM judges against real providers
 - **hindsight-integration-tests/**: E2E and integration test suites requiring a running server (live API or docker-compose)
 - **hindsight-extensions/**: Server extension slots (tenancy/auth, HTTP endpoints, MCP tools, operation validators, memory defense)
-- **hindsight-tools/**: Published agent tools SDK (`@vectorize-io/hindsight-agent-sdk`, harness-agnostic agent knowledge tools)
 - **hindsight-dev/**: Development tools and benchmarks
 
 ### Core Engine (hindsight-api-slim/hindsight_api/engine/)
 - `memory_engine.py`: Main orchestrator for retain/recall/reflect operations
-- `llm_wrapper.py`: LLM abstraction supporting OpenAI, Anthropic, Gemini, VertexAI, Groq, MiniMax, Ollama, LM Studio, LiteLLM, Claude Code, GitHub Copilot, DeepSeek, Fireworks, Codex (openai-codex), xAI (xai-oauth), Llama.cpp, Nous, etc. (See `hindsight-docs/docs/developer/configuration.md` for full provider lists)
+- `llm_wrapper.py`: LLM abstraction supporting OpenAI, Anthropic, Gemini, VertexAI, Groq, MiniMax, Ollama, LM Studio, LiteLLM, Claude Code, GitHub Copilot, DeepSeek, Fireworks, Codex (openai-codex), xAI (xai-oauth), Llama.cpp, Nous, etc. (See `hindsight-docs/docs/developer/configuration.mdx` for full provider lists)
 - `embeddings.py`: Embedding generation supporting local (SentenceTransformers) and standalone/remote providers (in-process: onnx; remote: tei, openai, cohere, zeroentropy, litellm, google, etc.)
-- `cross_encoder.py`: Reranking supporting local (CrossEncoder) and standalone/remote providers (in-process: flashrank, jina-mlx; remote: tei, cohere, siliconflow, zeroentropy, litellm, google, alibaba, etc.)
-- `entity_resolver.py`: Entity extraction and normalization
+- `cross_encoder.py`: Reranking supporting local (CrossEncoder) and standalone/remote providers (in-process: flashrank, onnx, jina-mlx; remote: tei, cohere, siliconflow, zeroentropy, litellm, google, alibaba, etc.)
 - `query_analyzer.py`: Query intent analysis
 
 **retain/**: Memory ingestion pipeline
 - `orchestrator.py`: Coordinates the retain flow
 - `fact_extraction.py`: LLM-based fact extraction from content
-- `link_utils.py`: Entity link creation and management
 
 **search/**: Multi-strategy retrieval
 - `retrieval.py`: Main retrieval orchestrator
 - `graph_retrieval.py`: Graph retrieval abstract base class
-- `link_expansion_retrieval.py`: Link expansion graph retrieval
 - `fusion.py`: Reciprocal rank fusion for combining results
 - `reranking.py`: Cross-encoder reranking
+
+**memories/**: The memories store, which owns every table a memory touches (`base.py` is the interface, `postgres.py` + `pg/` the default Postgres store — the only code allowed to name those tables)
+- `pg/entity_resolver.py`: Entity extraction and normalization
+- `pg/links.py`: Entity link creation and management
+- `pg/link_expansion.py`: Link expansion graph retrieval
 
 ### API Layer (hindsight-api-slim/hindsight_api/api/)
 - `http.py`: FastAPI HTTP routers for all REST endpoints
@@ -250,7 +252,8 @@ migration file dispatches through `run_for_dialect`, which calls either
 
 **Always run the lint script after making Python or TypeScript/Node changes:**
 ```bash
-./scripts/hooks/lint.sh
+./scripts/hooks/lint.sh            # packages that differ from origin/main
+LINT_ALL=1 ./scripts/hooks/lint.sh # everything, as CI does
 ```
 
 Dead-code detection runs in CI (the `check-unused-code` job) at two levels:
@@ -342,11 +345,12 @@ document it retains, so the control plane can show its logo instead of another
 - tag `harness:<id>` — the same value, so the documents list can filter on it
 
 The ids are defined by that integration's HookSpecs
-(`src/harness/hook-lifecycle.ts`, 11 harnesses) and persistent-plugin
+(`src/harness/hook-lifecycle.ts`, 15 harnesses) and persistent-plugin
 entrypoints (`src/harness/registry.ts`, 7 harnesses):
-currently `antigravity-cli`, `claude-code`, `cline-cli`, `codex`, `copilot-cli`,
-`cursor-cli`, `dcode`, `devin-cli`, `dsh`, `factory-droid`, `grok-build`,
-`kilo`, `opencode`, `opencode2`, `pi`, `prime-agent`, `qwen-code`, `zcode`.
+currently `antigravity-cli`, `claude-code`, `cline-cli`, `codebuddy`, `codex`,
+`copilot-cli`, `cursor-cli`, `dcode`, `devin-cli`, `dsh`, `factory-droid`,
+`grok-build`, `kilo`, `kimi-code`, `opencode`, `opencode2`, `pi`,
+`prime-agent`, `qwen-code`, `traecode`, `workbuddy`, `zcode`.
 
 The control plane resolves the value in
 `hindsight-control-plane/src/lib/harness-logo.ts` (metadata wins over the tag) and
@@ -376,6 +380,24 @@ the agent-only half (tools, crediting, corrections) lives in `skill-src/preamble
 `src/docs-freshness.test.ts` fails on a stale skill or an undocumented `RawConfig` field. Run
 `./scripts/hooks/lint.sh` BEFORE regenerating — prettier re-pads the README's tables, and a
 generated file built from unformatted source fails the byte comparison in CI.
+
+### Hermes docs are generated from one README
+
+Same arrangement, one generator: `hindsight-integrations/hermes/README.md` is the single source for
+the Hermes integration page. **Never edit `hindsight-docs/docs-integrations/hermes.md` by hand** —
+it is generated:
+
+```bash
+node hindsight-docs/scripts/sync-hermes-doc.mjs                  # README -> docs page
+```
+
+The docs build runs the same script with `--check`, so a stale page fails the build. Sections listed
+in the script's `DROP_SECTIONS` (currently `Development`) stay repo-only, which is where
+maintainer-facing notes belong — anything else in the README ships to the public page.
+
+Shipping a change to that directory reaches no user until the Hermes plugin catalog pin moves: open
+a follow-up PR against `NousResearch/hermes-agent` bumping `sha` and `version` together in
+`plugin-catalog/hindsight.yaml`.
 
 ### Adding New Integrations
 
@@ -437,7 +459,7 @@ Fields must be categorized as either **hierarchical** (can be overridden per-ten
    value = config.my_static_field
    ```
 
-5. **Documentation** (`hindsight-docs/docs/developer/configuration.md`):
+5. **Documentation** (`hindsight-docs/docs/developer/configuration.mdx`):
    - Add to appropriate section table with Variable, Description, Default
    - Mark if it's hierarchical (can be overridden per-bank)
 
@@ -489,7 +511,7 @@ Common server settings:
 - `HINDSIGHT_CP_DATAPLANE_API_URL`: Control Plane backend URL (default: `http://localhost:8888`)
 
 LLM settings:
-- `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, deepseek, groq, minimax, ollama, lmstudio, fireworks, openai-codex, xai-oauth, etc. (See `hindsight-docs/docs/developer/configuration.md` for full provider lists)
+- `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, deepseek, groq, minimax, ollama, lmstudio, fireworks, openai-codex, xai-oauth, etc. (See `hindsight-docs/docs/developer/configuration.mdx` for full provider lists)
 - `HINDSIGHT_API_LLM_API_KEY`: API key for providers that require one
 - `HINDSIGHT_API_LLM_MODEL`: Model name (defaults are provider-specific)
 

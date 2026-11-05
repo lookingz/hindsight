@@ -18,17 +18,22 @@
  */
 
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import type { ToolRunContext } from "@paperclipai/plugin-sdk";
+import type { EnvSecretRefBinding, PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { HindsightClient, formatMemories } from "./client.js";
 import { deriveBankId, extractUserFromIssue } from "./bank.js";
 
 interface PluginConfig {
   hindsightApiUrl: string;
-  hindsightApiKeyRef?: string;
+  /**
+   * Reference stored by the host's secret picker for the `format: "secret-ref"`
+   * field. The host fails closed on a bare string, so it travels through as-is.
+   */
+  hindsightApiKeyRef?: EnvSecretRefBinding;
   bankId?: string;
   dynamicBankId?: boolean;
   bankGranularity?: Array<"company" | "agent" | "user">;
   recallBudget?: "low" | "mid" | "high";
+  requestTimeoutMs?: number;
   autoRetain?: boolean;
   enabledAgentIds?: string[];
 }
@@ -58,13 +63,22 @@ async function getConfig(ctx: {
 }
 
 async function resolveApiKey(
-  ctx: { secrets: { resolve(ref: string): Promise<string | null> } },
-  config: PluginConfig
+  ctx: Pick<PluginContext, "secrets">,
+  config: PluginConfig,
+  companyId: string
 ): Promise<string | undefined> {
   if (!config.hindsightApiKeyRef) return undefined;
-  const resolved = await ctx.secrets.resolve(config.hindsightApiKeyRef);
+  // configPath identifies which binding to read when a plugin holds several
+  // secrets; companyId scopes the lookup to the run's company.
+  const resolved = await ctx.secrets.resolve(config.hindsightApiKeyRef, {
+    companyId,
+    configPath: "hindsightApiKeyRef",
+  });
   return resolved ?? undefined;
 }
+
+const DISABLED_FOR_AGENT =
+  "Hindsight memory is not enabled for this agent (see the plugin's enabledAgentIds setting).";
 
 function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null): boolean {
   const allowlist = config.enabledAgentIds;
@@ -120,8 +134,8 @@ const plugin = definePlugin({
       }
 
       try {
-        const apiKey = await resolveApiKey(ctx, config);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+        const apiKey = await resolveApiKey(ctx, config, companyId);
+        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
         const bankId = deriveBankId({ companyId, agentId, userId }, config);
 
         const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
@@ -131,6 +145,12 @@ const plugin = definePlugin({
           await ctx.state.set(
             { scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" },
             memories
+          );
+          // Remember which query produced the cache, so the recall tool only
+          // reuses it for that same query.
+          await ctx.state.set(
+            { scopeKind: "run", scopeId: runId, stateKey: "recalled-query" },
+            query
           );
           ctx.logger.info("Recalled memories for run", {
             runId,
@@ -220,8 +240,8 @@ const plugin = definePlugin({
       }
 
       try {
-        const apiKey = await resolveApiKey(ctx, config);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+        const apiKey = await resolveApiKey(ctx, config, companyId);
+        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
         const bankId = deriveBankId({ companyId, agentId: bankAgentId, userId }, config);
         await client.retain(bankId, body, commentId, {
           agentId: bankAgentId,
@@ -277,6 +297,13 @@ const plugin = definePlugin({
         const { query } = params as { query: string };
         const config = await getConfig(ctx);
 
+        // The allowlist has to be enforced here too, not just in the event
+        // handlers: the tools are registered for every agent, so without this
+        // an agent left out of enabledAgentIds could still read its bank.
+        if (!isAgentEnabled(config, runCtx.agentId)) {
+          return { content: DISABLED_FOR_AGENT };
+        }
+
         // Read userId cached by agent.run.started for consistent bank derivation
         let userId: string | undefined;
         if (config.bankGranularity?.includes("user")) {
@@ -293,20 +320,36 @@ const plugin = definePlugin({
           config
         );
 
-        // Return cached memories from run start if available
+        // Reuse the run-start recall only when the agent asks the same query;
+        // any other query must hit Hindsight, otherwise mid-run lookups would
+        // always get the issue-level memories back.
         const cached = await ctx.state.get({
           scopeKind: "run",
           scopeId: runCtx.runId,
           stateKey: "recalled-memories",
         });
-        if (cached && typeof cached === "string") {
+        const cachedQuery = await ctx.state.get({
+          scopeKind: "run",
+          scopeId: runCtx.runId,
+          stateKey: "recalled-query",
+        });
+        if (
+          cached &&
+          typeof cached === "string" &&
+          typeof cachedQuery === "string" &&
+          cachedQuery.trim() === query.trim()
+        ) {
           return { content: cached };
         }
 
         // Live recall fallback
         try {
-          const apiKey = await resolveApiKey(ctx, config);
-          const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+          const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
+          const client = new HindsightClient(
+            config.hindsightApiUrl,
+            apiKey,
+            config.requestTimeoutMs
+          );
           const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
           const memories = formatMemories(response.results);
           return { content: memories || "No relevant memories found." };
@@ -340,6 +383,12 @@ const plugin = definePlugin({
         const { content } = params as { content: string };
         const config = await getConfig(ctx);
 
+        // Same gate as the recall tool: enabledAgentIds must hold on the tool
+        // path, otherwise an excluded agent could still write to its bank.
+        if (!isAgentEnabled(config, runCtx.agentId)) {
+          return { content: DISABLED_FOR_AGENT };
+        }
+
         // Read userId cached by agent.run.started for consistent bank derivation
         let userId: string | undefined;
         if (config.bankGranularity?.includes("user")) {
@@ -357,8 +406,12 @@ const plugin = definePlugin({
         );
 
         try {
-          const apiKey = await resolveApiKey(ctx, config);
-          const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+          const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
+          const client = new HindsightClient(
+            config.hindsightApiUrl,
+            apiKey,
+            config.requestTimeoutMs
+          );
           await client.retain(bankId, content, undefined, {
             agentId: runCtx.agentId,
             companyId: runCtx.companyId,
@@ -385,7 +438,7 @@ const plugin = definePlugin({
     }
 
     try {
-      const client = new HindsightClient(c.hindsightApiUrl);
+      const client = new HindsightClient(c.hindsightApiUrl, undefined, c.requestTimeoutMs);
       const healthy = await client.health();
       if (!healthy) {
         return {

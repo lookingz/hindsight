@@ -2,19 +2,16 @@
 sidebar_position: 6
 ---
 
+import Figure from '@site/src/components/Figure';
+import mentalModelsFigure from '@site/figures/mental-models.json';
+
 # Mental Models
 
 A **mental model** is a standing answer to a question about a bank. You define the question once; Hindsight writes the answer, keeps it stored, and rewrites it in the background as the bank learns more.
 
 Where [observations](./observations) are produced automatically and are atomic — one belief at a time — a mental model is deliberately curated: you decide which questions deserve a permanent, always-current answer.
 
-```mermaid
-graph LR
-    A[Raw facts] --> B[Observations]
-    B --> C[Mental model]
-    A --> C
-    C --> D[Your application]
-```
+<Figure doc={mentalModelsFigure} />
 
 ---
 
@@ -43,6 +40,8 @@ Each layer is a cheaper, more settled version of the one below it. If the first 
 A mental model is not a cached answer that goes stale silently. Hindsight tracks whether new memories have arrived that the model is supposed to cover, and rebuilds it when they have — either as soon as new knowledge is consolidated, or on a schedule you set.
 
 The check comes first, and it is scoped: a rebuild only happens when something *within this model's own scope* actually changed. A busy bank does not cause unrelated models to churn, and a scheduled rebuild over an unchanged bank costs nothing.
+
+With a [decision model](./decision-models) set up, a `delta` rebuild first asks it which of the new memories could change the model, and edits from those alone — when none could, the rebuild makes no LLM call. See [Knowledge Pages](./knowledge-pages#decision-model-refresh).
 
 When a model is handed to the reflect agent, it comes with a freshness signal — whether memories in its scope have landed since it was last written. A model that has fallen behind is still shown, but it no longer short-circuits retrieval, and the agent is expected to check it against the layers below rather than trust it blindly.
 
