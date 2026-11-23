@@ -150,11 +150,20 @@ MB=$(git merge-base "$BACKUP" main)
    caches - it has no install API, so the runtime can never auto-install the
    routine and the `is_installed` fallback IS the CN path. Re-confirm this
    still holds after any poller/optional-routines refactor.
-6. **Deploy-image references**: diff upstream changes (`git diff "$MB" main --`)
-   against every path `docker/standalone/Dockerfile.deploy` COPYs - notably
-   `docker/standalone/start-all.sh` (the container entrypoint). Comment-only
-   changes are fine (happened 2026-11-23); functional changes need a
-   read-through before the upgrade is complete.
+6. **`Dockerfile.deploy` drift** (the most fragile CN file): it is upstream's
+   `docker/standalone/Dockerfile` plus three fixed deltas - CN package mirrors,
+   `BUILD_PROXY`, `HF_ENDPOINT`/`HF_TOKEN`. If the sync touched the upstream
+   Dockerfile, the derived file is stale even when the merge was conflict-free.
+   Re-derive it from upstream, then confirm with
+
+   `git diff --no-index docker/standalone/Dockerfile docker/standalone/Dockerfile.deploy`
+
+   that only those deltas (plus the header) remain. It rotted silently from
+   2026-08 to 2026-11 (upstream moved to the uv workspace lockfile, node:24 and
+   a new control-plane build path) because nothing builds it between upgrades -
+   a clean merge is no evidence that it still builds. Also diff
+   `docker/standalone/start-all.sh` (the container entrypoint): comment-only
+   changes are fine (2026-11-23), functional changes need a read-through.
 
 ## Step 4 - Optional push
 
@@ -173,3 +182,8 @@ git push origin main
   host-local state as part of the upgrade flow.
 - Do not commit `.env` or `docker-compose.override.yaml` (gitignored,
   host-local only).
+- A verified branch says nothing about what is deployed. Pushing and
+  `scripts/deploy-cn.sh` are separate steps the user has to ask for, and the
+  deploy target has to be looked at, not assumed: on 2026-11-23 it turned out
+  to hold no Hindsight at all (wiped by an OS reinstall months earlier), so
+  "upgrade the deployment" there meant a fresh install.
