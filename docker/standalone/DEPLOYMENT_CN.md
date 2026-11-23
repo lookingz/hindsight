@@ -268,6 +268,7 @@ Agents then use `https://<reserved-api-subdomain>.vip.cpolar.cn/v1/default` and
 - Set a stable `HINDSIGHT_API_WORKER_ID` for Docker deployments. Otherwise the worker defaults to the container hostname, and recreated containers can leave async tasks stuck in `processing`.
 - The API needs working LLM and embeddings keys to start at all: it verifies both connections during startup and exits otherwise (`scripts/deploy-cn.sh` then fails its health check). To initialize a fresh database before the keys are in place, run `docker compose run --rm --no-deps --entrypoint hindsight-admin hindsight run-db-migration`.
 - `LITELLM_LOCAL_MODEL_COST_MAP=True` (set by the override) skips LiteLLM's startup fetch of its price table from `raw.githubusercontent.com`, which otherwise stalls every start where that host is unreachable.
+- For `qwen3.8-flash` through DashScope, set `HINDSIGHT_API_LLM_EXTRA_BODY={"enable_thinking":false}` when reflect latency matters. The default thinking mode emits reasoning content; in one deployment it made complex reflect calls repeatedly hit the 30-second per-request timeout and the whole operation return 504. Disabling it also speeds retain/consolidation. Keep `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` at its 30-second default unless measurements show healthy calls need more.
 
 ## Async worker caveat for single-schema deployments
 
