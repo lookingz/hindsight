@@ -180,7 +180,34 @@ works. Publish `127.0.0.1:5432:5432` only if you need psql from the host itself.
 - Do not commit `.env` or `docker-compose.override.yaml`.
 - The control-plane `npm install` stage can still be slow on first build.
 - Local reranker works better through Docker than host-source startup because the image includes the needed local ML dependencies.
-- The image pre-downloads upstream's default local models (bge-small-en-v1.5, hs-rerank-1, embeddinggemma-2). A different `HINDSIGHT_API_RERANKER_LOCAL_MODEL` is fetched at runtime through `HF_ENDPOINT`, once per container.
+- The image pre-downloads upstream's default local models (bge-small-en-v1.5,
+  hs-rerank-1, embeddinggemma-2). Any other `HINDSIGHT_API_RERANKER_LOCAL_MODEL`
+  is fetched at runtime through `HF_ENDPOINT`, once per container. On a slow
+  mirror that download can exceed `HINDSIGHT_API_MODEL_INIT_TIMEOUT` (default
+  300s); the API then exits with "Model/connection initialization did not
+  complete", and every container recreation starts over. Either keep the
+  preloaded default, raise the timeout, or mount a volume at that model's own
+  cache directory so the download happens once (other models still come from
+  the image):
+
+  ```yaml
+      volumes:
+        - reranker_cache:/home/hindsight/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2
+  volumes:
+    reranker_cache:
+  ```
+
+  Seed it once as root, since a fresh volume is not writable by the container
+  user:
+
+  ```bash
+  docker compose run --rm --no-deps --user 0 \
+    -e HF_HUB_CACHE=/home/hindsight/.cache/huggingface/hub --entrypoint bash hindsight -c \
+    'python -c "from huggingface_hub import snapshot_download; snapshot_download(\"cross-encoder/ms-marco-MiniLM-L-6-v2\")" \
+     && chown -R 1000:1000 /home/hindsight/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2'
+  ```
+- The base file gives only the database a restart policy; the override adds
+  `restart: always` for the app so it comes back after a crash or a reboot.
 - Set a stable `HINDSIGHT_API_WORKER_ID` for Docker deployments. Otherwise the worker defaults to the container hostname, and recreated containers can leave async tasks stuck in `processing`.
 - The API needs working LLM and embeddings keys to start at all: it verifies both connections during startup and exits otherwise (`scripts/deploy-cn.sh` then fails its health check). To initialize a fresh database before the keys are in place, run `docker compose run --rm --no-deps --entrypoint hindsight-admin hindsight run-db-migration`.
 - `LITELLM_LOCAL_MODEL_COST_MAP=True` (set by the override) skips LiteLLM's startup fetch of its price table from `raw.githubusercontent.com`, which otherwise stalls every start where that host is unreachable.

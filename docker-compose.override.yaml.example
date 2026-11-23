@@ -51,6 +51,9 @@ services:
         - HF_TOKEN=${HF_TOKEN:-}
     env_file:
       - .env
+    # Deployment: come back after a crash or a host reboot. The base file only
+    # sets a restart policy for the database.
+    restart: always
     environment:
       HINDSIGHT_API_WORKER_ID: hindsight-app
       HINDSIGHT_API_TEXT_SEARCH_EXTENSION: native
