@@ -55,3 +55,8 @@ services:
       HINDSIGHT_API_WORKER_ID: hindsight-app
       HINDSIGHT_API_TEXT_SEARCH_EXTENSION: native
       HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE: 10
+      # LiteLLM fetches its model price table from raw.githubusercontent.com at
+      # startup and only falls back to the bundled copy after it times out - a
+      # long stall on every start where that host is unreachable. Use the
+      # bundled copy directly.
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"

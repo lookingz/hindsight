@@ -182,6 +182,8 @@ works. Publish `127.0.0.1:5432:5432` only if you need psql from the host itself.
 - Local reranker works better through Docker than host-source startup because the image includes the needed local ML dependencies.
 - The image pre-downloads upstream's default local models (bge-small-en-v1.5, hs-rerank-1, embeddinggemma-2). A different `HINDSIGHT_API_RERANKER_LOCAL_MODEL` is fetched at runtime through `HF_ENDPOINT`, once per container.
 - Set a stable `HINDSIGHT_API_WORKER_ID` for Docker deployments. Otherwise the worker defaults to the container hostname, and recreated containers can leave async tasks stuck in `processing`.
+- The API needs working LLM and embeddings keys to start at all: it verifies both connections during startup and exits otherwise (`scripts/deploy-cn.sh` then fails its health check). To initialize a fresh database before the keys are in place, run `docker compose run --rm --no-deps --entrypoint hindsight-admin hindsight run-db-migration`.
+- `LITELLM_LOCAL_MODEL_COST_MAP=True` (set by the override) skips LiteLLM's startup fetch of its price table from `raw.githubusercontent.com`, which otherwise stalls every start where that host is unreachable.
 
 ## Async worker caveat for single-schema deployments
 
