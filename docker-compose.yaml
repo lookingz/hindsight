@@ -27,8 +27,6 @@ services:
       dockerfile: docker/standalone/Dockerfile
       target: standalone
       args:
-        - INCLUDE_API=true
-        - INCLUDE_CP=true
         - INCLUDE_LOCAL_MODELS=true
         - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
         - HF_TOKEN=${HF_TOKEN:-}

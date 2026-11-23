@@ -1,6 +1,6 @@
-# docker-compose.override.yaml - CN deployment overrides
-# Place this file on the deployment server ONLY, do NOT commit to repo.
-# Docker Compose automatically merges this with docker-compose.yaml.
+# docker-compose.override.yaml - host override for the main-cn-llm-api deployment
+# Host-local file: copy this template, fill it in, and never commit it. Docker
+# Compose merges it with docker-compose.yaml automatically.
 #
 # Usage:
 #   cp docker-compose.override.yaml.example docker-compose.override.yaml
@@ -8,10 +8,12 @@
 #   docker compose build hindsight
 #   docker compose up -d
 #
-# Recommended for the `main-cn-llm-api` deployment branch:
-# - Uses `docker/standalone/Dockerfile.deploy`
-# - Supports build-time proxy via BUILD_PROXY
-# - Supports Hugging Face mirror/token via HF_ENDPOINT / HF_TOKEN
+# What it changes:
+# - Builds docker/standalone/Dockerfile.deploy (upstream Dockerfile + CN mirrors,
+#   optional BUILD_PROXY, HF_ENDPOINT / HF_TOKEN)
+# - Pulls the database image through a CN registry mirror, and stops publishing
+#   the database port on the host
+# - Loads runtime config/secrets from .env
 # - Keeps local reranker / local models enabled in the image
 # - Sets a stable Hindsight worker id to avoid stuck `processing` tasks after container recreation
 # - Leaves secrets in `.env`, not in this file
@@ -21,15 +23,31 @@ services:
     image: ghcr.1ms.run/tensorchord/vchord-suite:pg16-latest
     environment:
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    # The base file publishes 5432 on every host interface. A database usually
+    # should not be reachable from the host network at all: `!reset` (Compose >= 2.24)
+    # drops that mapping and leaves the database on the compose network only -
+    # `docker exec hindsight-db psql ...` still works. Replace it with
+    # `ports: ["127.0.0.1:5432:5432"]` if you need psql from the host itself.
+    ports: !reset []
 
   hindsight:
     build:
+      # Source tree = Docker build context. `.` keeps everything in one checkout.
+      # Hosts that keep build workspaces apart from the deployment entry set
+      # HINDSIGHT_SOURCE_DIR in .env instead (DEPLOYMENT_CN.md, "Split layout").
+      context: ${HINDSIGHT_SOURCE_DIR:-.}
       dockerfile: docker/standalone/Dockerfile.deploy
+      # BUILD_PROXY usually listens on the host's loopback only, which a build
+      # container cannot reach (127.0.0.1 is the container itself). If so,
+      # uncomment so build steps run on the host network and point BUILD_PROXY
+      # at http://127.0.0.1:<port>. Build-time only; runtime containers are
+      # not affected.
+      # network: host
       args:
-        - INCLUDE_API=true
-        - INCLUDE_CP=true
         - INCLUDE_LOCAL_MODELS=true
         - BUILD_PROXY=${BUILD_PROXY:-}
+        - BUILD_NO_PROXY=${BUILD_NO_PROXY:-}
+        - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
         - HF_TOKEN=${HF_TOKEN:-}
     env_file:
       - .env

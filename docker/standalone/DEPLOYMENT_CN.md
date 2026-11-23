@@ -14,16 +14,40 @@ This branch uses a China-friendly Docker deployment flow centered on `docker/sta
 - Local server-only override: `docker-compose.override.yaml`
 - Deployment Dockerfile: `docker/standalone/Dockerfile.deploy`
 - Runtime secrets/config: `.env`
+- Deploy / rollback / status script: `scripts/deploy-cn.sh`
 
-## What `Dockerfile.deploy` does
+## What `Dockerfile.deploy` is
 
-- Switches Debian and Python package downloads to China mirrors.
-- Uses `BUILD_PROXY` for build-time `apt`, `npm`, and model download traffic.
-- Supports `HF_ENDPOINT` and `HF_TOKEN` for Hugging Face model downloads.
-- Builds the standalone image with API + control plane.
-- Keeps local model dependencies enabled so `HINDSIGHT_API_RERANKER_PROVIDER=local` can run inside the container.
+A derived copy of upstream's `docker/standalone/Dockerfile` plus three CN deltas,
+nothing else:
+
+- Package mirrors: Debian apt, Alpine apk, the npm registry and the PyPI bootstrap
+  of `uv` resolve through Aliyun / npmmirror.
+- `BUILD_PROXY` (optional): HTTP proxy for build-time wheel, npm tarball and
+  Hugging Face downloads. apt always talks to the mirror directly. Never baked
+  into the image. `BUILD_NO_PROXY` lists hosts that must stay direct.
+- `HF_ENDPOINT` / `HF_TOKEN` (optional): Hugging Face mirror and token for the
+  build-time model pre-download.
+
+Upstream reworks its Dockerfile regularly (uv workspace lockfile, Node base
+version, control-plane build path). When a sync changes
+`docker/standalone/Dockerfile`, **re-derive `Dockerfile.deploy` from it** instead
+of patching forward, then check the drift:
+
+```bash
+git diff --no-index docker/standalone/Dockerfile docker/standalone/Dockerfile.deploy
+```
+
+Only the deltas above (and the header) may show. An actual build is the only
+real test: between 2026-08 and 2026-11 this file fell three months behind
+upstream without any signal, and no longer built the current source.
+
+The image keeps local model dependencies enabled, so `HINDSIGHT_API_RERANKER_PROVIDER=local`
+can run inside the container.
 
 ## Recommended `.env` items
+
+Runtime:
 
 - `HINDSIGHT_API_LLM_PROVIDER`
 - `HINDSIGHT_API_LLM_API_KEY`
@@ -36,20 +60,71 @@ This branch uses a China-friendly Docker deployment flow centered on `docker/sta
 - `HINDSIGHT_API_RERANKER_PROVIDER=local`
 - `HINDSIGHT_API_RERANKER_LOCAL_MODEL`
 - `HINDSIGHT_API_WORKER_ID=hindsight-app`
-- `HF_ENDPOINT`
-- `HF_TOKEN`
-- `BUILD_PROXY`
+
+Deployment:
+
+- `HINDSIGHT_DB_PASSWORD` - the base compose falls back to `hindsight_pass`;
+  set a real password on any server.
+- `COMPOSE_PROJECT_NAME` - optional; the base compose names the project `hindsight-local`.
+- `HINDSIGHT_SOURCE_DIR` - split layout only, see below.
+- `BUILD_PROXY`, `BUILD_NO_PROXY` - build-time only. The pytorch wheel host
+  (`download-r2.pytorch.org`) is often throttled to ~100 KB/s from China while
+  PyPI and the mirrors are fast, so proxy only what needs it:
+
+  ```
+  BUILD_PROXY=http://127.0.0.1:7890
+  BUILD_NO_PROXY=mirrors.aliyun.com,files.pythonhosted.org,pypi.org,registry.npmmirror.com,hf-mirror.com
+  ```
+
+  It is used from inside the build container, so `127.0.0.1` is the container,
+  not the host. If the proxy only listens on the host loopback, uncomment
+  `network: host` in the override so build steps share the host network.
+- `HF_ENDPOINT`, `HF_TOKEN`
 
 ## First-time deploy
+
+Single checkout that holds everything (source, compose files, `.env`, build):
 
 ```bash
 git checkout main-cn-llm-api
 cp docker-compose.override.yaml.example docker-compose.override.yaml
+# fill in .env
 docker compose build hindsight
 docker compose up -d
 docker compose ps
 docker compose logs -f hindsight
 ```
+
+### Split layout
+
+For hosts that keep Git working trees and Docker build contexts in a dedicated
+build workspace, with application entries under a services directory. The
+checkout is only the build context; the deployment entry holds compose + config.
+
+```bash
+# 1. checkout = build context (shallow is enough: every deploy fetches on top,
+#    and rollback targets are commits that were already deployed)
+git clone --depth 1 --branch main-cn-llm-api \
+  https://github.com/<fork>/hindsight.git <source-dir>
+
+# 2. deployment entry
+mkdir -p <deploy-dir> && cd <deploy-dir>
+cp <source-dir>/docker-compose.yaml .
+cp <source-dir>/docker-compose.override.yaml.example docker-compose.override.yaml
+# .env: the usual settings, plus
+#   HINDSIGHT_SOURCE_DIR=<source-dir>
+```
+
+Locally, `.deploy-env.local` then carries three paths:
+
+```
+DEPLOY_HOST=<host>
+DEPLOY_DIR=<deploy-dir>
+DEPLOY_SOURCE_DIR=<source-dir>
+```
+
+`scripts/deploy-cn.sh` resets the checkout, copies `docker-compose.yaml` into
+the entry dir, and builds / restarts from there.
 
 ## Re-deploy after updates
 
@@ -61,13 +136,13 @@ git push origin main-cn-llm-api
 scripts/deploy-cn.sh
 ```
 
-The script SSHes into the deploy host (set `DEPLOY_HOST` and optionally
-`DEPLOY_DIR` in the environment or a gitignored `.deploy-env.local`), resets
-its checkout to `origin/main-cn-llm-api`, rebuilds, restarts, and waits for the
-API health check. Gitignored host-local files (`.env`,
-`docker-compose.override.yaml`) are left untouched.
+The script SSHes into the deploy host (set `DEPLOY_HOST`, `DEPLOY_DIR` and
+optionally `DEPLOY_SOURCE_DIR` in the environment or a gitignored
+`.deploy-env.local`), resets its checkout to `origin/main-cn-llm-api`, rebuilds,
+restarts, and waits for the API health check. Gitignored host-local files
+(`.env`, `docker-compose.override.yaml`) are left untouched.
 
-Equivalent manual steps on the host:
+Equivalent manual steps on the host (single-dir layout):
 
 ```bash
 git checkout main-cn-llm-api
@@ -77,11 +152,22 @@ docker compose build hindsight
 docker compose up -d
 ```
 
-Rollback rebuilds the previously deployed commit:
+## Rollback
 
 ```bash
 scripts/deploy-cn.sh rollback
 ```
+
+Rebuilds the commit recorded in `<deploy-dir>/.deploy-last`: the one that was
+running before the current deployment. The script writes it before anything is
+switched, so it is also the right target after a failed health check.
+
+## Database port
+
+The base compose publishes 5432 on every host interface. The override template
+drops that with `ports: !reset []` (Compose >= 2.24): the database is reachable
+only on the compose network, and `docker exec hindsight-db psql ...` still
+works. Publish `127.0.0.1:5432:5432` only if you need psql from the host itself.
 
 ## Verification
 
@@ -94,6 +180,7 @@ scripts/deploy-cn.sh rollback
 - Do not commit `.env` or `docker-compose.override.yaml`.
 - The control-plane `npm install` stage can still be slow on first build.
 - Local reranker works better through Docker than host-source startup because the image includes the needed local ML dependencies.
+- The image pre-downloads upstream's default local models (bge-small-en-v1.5, hs-rerank-1, embeddinggemma-2). A different `HINDSIGHT_API_RERANKER_LOCAL_MODEL` is fetched at runtime through `HF_ENDPOINT`, once per container.
 - Set a stable `HINDSIGHT_API_WORKER_ID` for Docker deployments. Otherwise the worker defaults to the container hostname, and recreated containers can leave async tasks stuck in `processing`.
 
 ## Async worker caveat for single-schema deployments
