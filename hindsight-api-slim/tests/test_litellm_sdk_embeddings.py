@@ -676,6 +676,7 @@ class TestLiteLLMSDKEmbeddingsFactory:
     def test_create_from_env_uses_configured_openai_batch_size(self, monkeypatch):
         """Test litellm-sdk embeddings inherit the shared OpenAI-compatible batch size."""
         mock_config = MagicMock()
+        mock_config.query_embeddings = mock_config.passage_embeddings = None  # no split
         mock_config.embeddings_provider = "litellm-sdk"
         mock_config.embeddings_litellm_sdk_api_key = "test_key"
         mock_config.embeddings_litellm_sdk_model = "openai/text-embedding-v4"
