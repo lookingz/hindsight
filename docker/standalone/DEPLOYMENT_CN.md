@@ -169,6 +169,43 @@ drops that with `ports: !reset []` (Compose >= 2.24): the database is reachable
 only on the compose network, and `docker exec hindsight-db psql ...` still
 works. Publish `127.0.0.1:5432:5432` only if you need psql from the host itself.
 
+## Single-user authentication (before any public tunnel)
+
+The API and control plane are open by default. For a personal deployment exposed
+through a tunnel, enable both layers before publishing anything:
+
+```bash
+# Independent, randomly generated secrets; do not reuse the LLM provider keys.
+HINDSIGHT_CP_ACCESS_KEY=<control-plane login key>
+HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+HINDSIGHT_API_TENANT_API_KEY=<dataplane Bearer key>
+HINDSIGHT_CP_DATAPLANE_API_KEY=<same dataplane Bearer key>
+```
+
+Then run `docker compose up -d hindsight`.
+
+- The control plane shows a login page and issues a 24-hour HttpOnly session
+  cookie after the shared key is entered. HTTPS adds `Secure` automatically.
+- The dataplane requires `Authorization: Bearer ...`; health endpoints remain
+  public for deployment checks.
+- This is a single shared-key gate, not user accounts, roles or per-user memory
+  isolation. The built-in API-key tenant still uses the `public` schema.
+- Expose only control-plane port 9999 through the tunnel. Keep dataplane 8888 on
+  loopback; the control plane calls it internally with the Bearer key.
+
+A cpolar tunnel entry looks like this (use your own reserved subdomain and
+follow the host's shared-tunnel procedures; do not start a second cpolar):
+
+```yaml
+  hindsight:
+    proto: http
+    addr: 127.0.0.1:9999
+    region: cn_vip
+    subdomain: <reserved-subdomain>
+    bind_tls: true
+    inspect: false
+```
+
 ## Verification
 
 - API: `http://localhost:8888` (liveness: `/health/live`, readiness: `/health`)
