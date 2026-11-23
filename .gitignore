@@ -84,3 +84,4 @@ docker-compose.override.yaml
 .deploy-env.local
 # Private upgrade skill - local only, never publish
 .claude/skills/hs-upgrade/
+.agents/skills/hs-upgrade/
