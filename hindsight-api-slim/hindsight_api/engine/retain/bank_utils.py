@@ -256,6 +256,16 @@ async def bank_exists_on_conn(conn: "DatabaseConnection", bank_id: str) -> bool:
     return await conn.fetchval(f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1", bank_id) is not None
 
 
+async def bank_kind_on_conn(conn: "DatabaseConnection", bank_id: str) -> str | None:
+    """The bank's kind ('memory' or 'knowledge'), or None when there is no such bank."""
+    return await conn.fetchval(f"SELECT kind FROM {fq_table('banks')} WHERE bank_id = $1", bank_id)
+
+
+async def bank_kind(pool, bank_id: str) -> str | None:
+    async with acquire_with_retry(pool) as conn:
+        return await bank_kind_on_conn(conn, bank_id)
+
+
 async def bank_exists(pool, bank_id: str) -> bool:
     """Dedicated-connection variant of ``bank_exists_on_conn``.
 
@@ -539,104 +549,6 @@ async def set_bank_mission(pool, bank_id: str, mission: str) -> None:
     await bank_info_cache.invalidate(bank_id, "profile")
 
 
-async def merge_bank_mission(pool, llm_config, bank_id: str, new_info: str) -> dict:
-    """
-    Merge new mission information with existing mission using LLM.
-    Normalizes to first person ("I") and resolves conflicts.
-
-    Args:
-        pool: Database connection pool
-        llm_config: LLM configuration for mission merging
-        bank_id: bank IDentifier
-        new_info: New mission information to add/merge
-
-    Returns:
-        Dict with 'mission' (str) key
-    """
-    # Get current profile
-    profile = await get_bank_profile(pool, bank_id)
-    current_mission = profile["mission"]
-
-    # Use LLM to merge missions
-    result = await _llm_merge_mission(llm_config, current_mission, new_info)
-
-    merged_mission = result["mission"]
-
-    # Update in database
-    async with acquire_with_retry(pool) as conn:
-        await conn.execute(
-            f"""
-            UPDATE {fq_table("banks")}
-            SET mission = $2,
-                updated_at = NOW()
-            WHERE bank_id = $1
-            """,
-            bank_id,
-            merged_mission,
-        )
-
-    # The profile row just changed; the next read must not serve the entry loaded before it.
-    from .. import bank_info_cache
-
-    await bank_info_cache.invalidate(bank_id, "profile")
-
-    return {"mission": merged_mission}
-
-
-async def _llm_merge_mission(llm_config, current: str, new_info: str) -> dict:
-    """
-    Use LLM to intelligently merge mission information.
-
-    Args:
-        llm_config: LLM configuration to use
-        current: Current mission text
-        new_info: New information to merge
-
-    Returns:
-        Dict with 'mission' (str) key
-    """
-    prompt = f"""You are helping maintain an agent's mission statement.
-
-Current mission: {current if current else "(empty)"}
-
-New information to add: {new_info}
-
-Instructions:
-1. Merge the new information with the current mission
-2. If there are conflicts, the NEW information overwrites the old
-3. Keep additions that don't conflict
-4. Output in FIRST PERSON ("I") perspective
-5. Be concise - keep it under 500 characters
-6. Return ONLY the merged mission text, no explanations
-
-Merged mission:"""
-
-    try:
-        messages = [{"role": "user", "content": prompt}]
-
-        call_result = await llm_config.call(
-            messages=messages, scope="bank_mission", temperature=0.3, max_completion_tokens=8192
-        )
-        content = call_result.content
-
-        logger.info(f"LLM response for mission merge (first 500 chars): {content[:500]}")
-
-        merged = content.strip()
-        if not merged or merged.lower() in ["(empty)", "none", "n/a"]:
-            merged = new_info if new_info else ""
-        return {"mission": merged}
-
-    except Exception as e:
-        logger.error(f"Error merging mission with LLM: {e}")
-        # Fallback: just append new info
-        if current:
-            merged = f"{current} {new_info}".strip()
-        else:
-            merged = new_info
-
-        return {"mission": merged}
-
-
 # Sort floor for banks that have never been written to and carry no created_at.
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -697,14 +609,15 @@ async def list_banks(pool, *, search_query: str | None = None) -> list:
     # Spelled out as UPPER(...) LIKE UPPER(...) rather than ILIKE: the Oracle
     # rewriter only recognizes ILIKE on an unqualified column, and these are
     # alias-qualified.
-    where_clause = ""
+    # Knowledge banks share the `banks` table but have their own list (see hindsight_api/knowledge).
+    where_clause = "WHERE b.kind = 'memory'"
     params: list[str] = []
     if search_query:
         # Aliases are matched too, so searching the id a caller actually uses finds
         # the bank it reaches. Mid-migration that is the only id someone may know:
         # without this, the new id is live in the API but invisible in the picker.
         where_clause = (
-            "WHERE (UPPER(b.bank_id) LIKE UPPER($1) OR UPPER(COALESCE(b.name, '')) LIKE UPPER($2) "
+            "WHERE b.kind = 'memory' AND (UPPER(b.bank_id) LIKE UPPER($1) OR UPPER(COALESCE(b.name, '')) LIKE UPPER($2) "
             f"OR EXISTS (SELECT 1 FROM {fq_table('bank_aliases')} a "
             "WHERE a.bank_id = b.bank_id AND UPPER(a.alias) LIKE UPPER($3)))"
         )
@@ -1003,7 +916,8 @@ async def _banks_by_created(pool, want: int) -> "list[BankWriteTime]":
             # `bank_id` breaks ties: banks created in one batch share a `created_at`, and without a
             # tiebreaker Postgres may order them differently for the page-1 LIMIT than for the
             # page-2 one, which shows up as a bank on both pages or on neither.
-            f"SELECT bank_id, created_at FROM {banks_table} ORDER BY created_at DESC NULLS LAST, bank_id DESC LIMIT $1",
+            f"SELECT bank_id, created_at FROM {banks_table} WHERE kind = 'memory' "
+            "ORDER BY created_at DESC NULLS LAST, bank_id DESC LIMIT $1",
             want,
         )
     return [BankWriteTime(bank_id=r["bank_id"], last_write_at=_as_utc(r["created_at"]) or _UNIX_EPOCH) for r in rows]
@@ -1012,7 +926,7 @@ async def _banks_by_created(pool, want: int) -> "list[BankWriteTime]":
 async def _count_banks(pool) -> int:
     banks_table = fq_table("banks")
     async with acquire_with_retry(pool) as conn:
-        row = await conn.fetchrow(f"SELECT COUNT(*) AS n FROM {banks_table}")
+        row = await conn.fetchrow(f"SELECT COUNT(*) AS n FROM {banks_table} WHERE kind = 'memory'")
     return int(row["n"]) if row else 0
 
 

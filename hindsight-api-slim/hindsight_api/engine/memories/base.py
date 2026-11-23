@@ -65,7 +65,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-#: The page :meth:`MemoriesExtension._scan_all_memories` asks for — no larger than a store's page
+#: The page :meth:`MemoriesExtension.scan_all_memories` asks for — no larger than a store's page
 #: cap, so every page is served whole.
 _SCAN_ALL_PAGE = 1000
 
@@ -763,11 +763,23 @@ def watermark_may_postdate(last_refreshed_at: datetime | None, watermark: dateti
 
 
 @dataclass(frozen=True)
+class ReflectFreshness:
+    """What reflect reads about a bank before it starts (see ``MemoriesExtension.reflect_freshness``).
+
+    ``pending`` may lag the bank's writes; ``last_memory_write_at`` may be later than the
+    bank's newest write but never earlier, and is None only for an empty bank.
+    """
+
+    pending: int
+    last_memory_write_at: datetime | None
+
+
+@dataclass(frozen=True)
 class MemoryScopeWatermark:
     """One "has this scope changed?" question, for the batched staleness check.
 
     ``key`` is opaque to the store — it is whatever the caller wants the answer
-    reported under (a mental-model id, a knowledge-page id) — and the scope
+    reported under (a mental-model id, a page id) — and the scope
     fields are the same ones :meth:`MemoriesExtension.any_memory_updated_since`
     takes for a single model, so the two surfaces cannot drift apart.
     """
@@ -933,8 +945,8 @@ class FullRecallRequest:
 
 
 @dataclass
-class KnowledgePageEntry:
-    """One knowledge page as the store indexes it.
+class PageEntry:
+    """One page as the store indexes it.
 
     Only what a search needs. The page's own row — its name, body, folder, trigger, history —
     stays in Postgres, which remains the authority; this is the derived half.
@@ -949,13 +961,13 @@ class KnowledgePageEntry:
     #: The page's visibility tags, so a scoped search filters inside the store rather than
     #: over-fetching and discarding — a discarded hit has already cost a top-k slot.
     tags: list[str] = field(default_factory=list)
-    #: When the page's row last changed. Read back by :meth:`MemoriesExtension.list_knowledge_pages`
+    #: When the page's row last changed. Read back by :meth:`MemoriesExtension.list_pages`
     #: so a reconcile can spot a stale index entry without reading the page.
     updated_at: datetime | None = None
 
 
 @dataclass
-class KnowledgePageRef:
+class PageRef:
     """A page as the reconcile pass sees it: what the store holds and how old it thinks it is."""
 
     page_id: str
@@ -963,7 +975,7 @@ class KnowledgePageRef:
 
 
 @dataclass
-class KnowledgePageMatch:
+class PageMatch:
     """One search result. ``score`` is comparable within a result set, not across stores."""
 
     page_id: str
@@ -1034,6 +1046,8 @@ class DocumentChunkState:
     content_hash: str | None
     original_text: str | None
     chunks: list[ExistingChunk] = field(default_factory=list)
+    # The document's tags at load, before the retain rewrites them; None when not readable.
+    tags: list[str] | None = None
 
 
 def document_chunk_state(
@@ -1053,6 +1067,7 @@ def document_chunk_state(
     return DocumentChunkState(
         content_hash=rec.get("content_hash"),
         original_text=rec.get("original_text") if include_text else None,
+        tags=list(rec["tags"] or []) if "tags" in rec else None,
         chunks=[
             ExistingChunk(
                 chunk_id=build_chunk_id(bank_id, document_id, index),
@@ -1097,6 +1112,8 @@ class EntityResolverHandle(Protocol):
 
     def discard_pending_stats(self) -> None: ...
 
+    def forget_pending_mentions(self, entity_ids: list[str]) -> None: ...
+
     async def flush_pending_stats(self, conn: Any | None = None) -> None: ...
 
     async def reassert_entities_batch(self, bank_id: str, resolved_entities: list[Any], conn) -> None: ...
@@ -1107,6 +1124,12 @@ class EntityResolverHandle(Protocol):
         conn=None,
         bank_id: str | None = None,
     ) -> None: ...
+
+
+# Deprecated names from before pages were renamed. Remove in 2.x.
+KnowledgePageEntry = PageEntry
+KnowledgePageRef = PageRef
+KnowledgePageMatch = PageMatch
 
 
 class MemoriesExtension(Extension, ABC):
@@ -1149,9 +1172,9 @@ class MemoriesExtension(Extension, ABC):
     #: entire retain — resolution, upserts and the document replace — as ONE atomic server-side call
     #: (``retain``). The orchestrator then needs no Postgres connection phase for it.
     #:
-    #: It also selects the KNOWLEDGE-PAGE index: a store that owns its memories serves
-    #: `search_knowledge_pages` and the reflect tool from its own index, and the page write paths
-    #: call :meth:`index_knowledge_pages` / :meth:`delete_knowledge_pages`. The Postgres row is
+    #: It also selects the PAGE index: a store that owns its memories serves
+    #: `search_pages` and the reflect tool from its own index, and the page write paths
+    #: call :meth:`index_pages` / :meth:`delete_pages`. The Postgres row is
     #: still written first and is still what a hit is hydrated from — the store holds a DERIVED
     #: copy, so a divergence is repaired by indexing again rather than restored from a backup.
     #:
@@ -1248,9 +1271,9 @@ class MemoriesExtension(Extension, ABC):
         live in different backends. Defaults to the class attribute."""
         return self.derives_semantic_links_internally
 
-    # -- the knowledge-page index -------------------------------------------
+    # -- the page index -------------------------------------------
     #
-    # Knowledge pages are the one place where a store holds a DERIVED copy rather than the
+    # Pages are the one place where a store holds a DERIVED copy rather than the
     # authority. The page's row stays in Postgres; the store keeps only an index over its text and
     # embedding, so a lost or diverged entry is repaired by indexing it again and the two never need
     # a transaction between them.
@@ -1261,7 +1284,7 @@ class MemoriesExtension(Extension, ABC):
     # already the thing answering its searches, so splitting the two only creates a combination
     # nothing sets and every call site has to keep handling.
 
-    async def index_knowledge_pages(self, bank_id: str, entries: list["KnowledgePageEntry"]) -> None:
+    async def index_pages(self, bank_id: str, entries: list["PageEntry"]) -> None:
         """Upsert pages into the store's index. A ``page_id`` already present is replaced.
 
         Called after the Postgres row is committed, so an entry here always describes a row that
@@ -1271,12 +1294,95 @@ class MemoriesExtension(Extension, ABC):
         Replacing rather than merging is deliberate: a derived index has nothing worth preserving
         across a rewrite, and it makes re-indexing everything idempotent, which is what lets the
         reconcile pass be "put them all again"."""
-        raise NotImplementedError("this store does not index knowledge pages")
+        # Stores written before the rename implement the old name. Remove in 2.x.
+        return await self.index_knowledge_pages(bank_id, entries)
 
-    async def delete_knowledge_pages(self, bank_id: str, page_ids: list[str]) -> None:
+    async def delete_pages(self, bank_id: str, page_ids: list[str]) -> None:
         """Remove pages from the index. Deleting one the store does not hold must be a no-op, so a
         reconcile can reap an entry it believes is stale without first proving it is there."""
-        raise NotImplementedError("this store does not index knowledge pages")
+        # Stores written before the rename implement the old name. Remove in 2.x.
+        return await self.delete_knowledge_pages(bank_id, page_ids)
+
+    async def search_pages(
+        self,
+        bank_id: str,
+        *,
+        embedding: list[float] | None,
+        text: str,
+        limit: int,
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list | None = None,
+    ) -> list["PageMatch"]:
+        """Hybrid search over the bank's pages: text and (when given) embedding, fused BY THE STORE.
+
+        Fusion is the store's business because only it knows what its arms produce — one returning
+        ranks and another returning distances cannot share a caller-side formula. ``score`` is
+        therefore comparable within one result set and meaningless across stores; callers order by
+        it and do not otherwise interpret it.
+
+        Returns ids only. The caller joins them back to Postgres for name, snippet and folder — and
+        that join is also what filters out ids that are not pages, so the store never needs to know
+        the difference between a page and a pinned mental model."""
+        # Stores written before the rename implement the old name. Remove in 2.x.
+        return await self.search_knowledge_pages(
+            bank_id,
+            embedding=embedding,
+            text=text,
+            limit=limit,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
+        )
+
+    async def search_pages_semantic(
+        self,
+        bank_id: str,
+        *,
+        embedding: list[float],
+        limit: int,
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list | None = None,
+        exclude_ids: list[str] | None = None,
+    ) -> list["PageMatch"]:
+        """Pure vector search over the bank's pages, for the reflect tool.
+
+        Separate from :meth:`search_pages` because the two want different answers, not
+        different tunings of one: this one reports ``score`` as a **similarity in [0, 1]**, which
+        the agent surfaces as a relevance figure, and a fused hybrid score cannot stand in for it.
+
+        ``exclude_ids`` drops pages from the result — a refresh must not retrieve the very page it
+        is regenerating."""
+        # Stores written before the rename implement the old name. Remove in 2.x.
+        return await self.search_knowledge_pages_semantic(
+            bank_id,
+            embedding=embedding,
+            limit=limit,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
+            exclude_ids=exclude_ids,
+        )
+
+    async def list_pages(self, bank_id: str) -> list["PageRef"]:
+        """Every page the store currently indexes for this bank.
+
+        The read half of the reconcile: diff it against the bank's `mental_models` rows to find both
+        what is missing from the index and what is left over in it. Bounded by the bank's page
+        count, which is a curated set rather than its corpus."""
+        # Stores written before the rename implement the old name. Remove in 2.x.
+        return await self.list_knowledge_pages(bank_id)
+
+    # Deprecated names from before pages were renamed. Remove in 2.x.
+
+    async def index_knowledge_pages(self, bank_id: str, entries: list["PageEntry"]) -> None:
+        """Deprecated name of :meth:`index_pages`, still called when a store overrides it. Remove in 2.x."""
+        raise NotImplementedError("this store does not index pages")
+
+    async def delete_knowledge_pages(self, bank_id: str, page_ids: list[str]) -> None:
+        """Deprecated name of :meth:`delete_pages`, still called when a store overrides it. Remove in 2.x."""
+        raise NotImplementedError("this store does not index pages")
 
     async def search_knowledge_pages(
         self,
@@ -1288,18 +1394,9 @@ class MemoriesExtension(Extension, ABC):
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
         tag_groups: list | None = None,
-    ) -> list["KnowledgePageMatch"]:
-        """Hybrid search over the bank's pages: text and (when given) embedding, fused BY THE STORE.
-
-        Fusion is the store's business because only it knows what its arms produce — one returning
-        ranks and another returning distances cannot share a caller-side formula. ``score`` is
-        therefore comparable within one result set and meaningless across stores; callers order by
-        it and do not otherwise interpret it.
-
-        Returns ids only. The caller joins them back to Postgres for name, snippet and folder — and
-        that join is also what filters out ids that are not pages, so the store never needs to know
-        the difference between a page and a pinned mental model."""
-        raise NotImplementedError("this store does not index knowledge pages")
+    ) -> list["PageMatch"]:
+        """Deprecated name of :meth:`search_pages`, still called when a store overrides it. Remove in 2.x."""
+        raise NotImplementedError("this store does not index pages")
 
     async def search_knowledge_pages_semantic(
         self,
@@ -1311,24 +1408,13 @@ class MemoriesExtension(Extension, ABC):
         tags_match: TagsMatch = "any",
         tag_groups: list | None = None,
         exclude_ids: list[str] | None = None,
-    ) -> list["KnowledgePageMatch"]:
-        """Pure vector search over the bank's pages, for the reflect tool.
+    ) -> list["PageMatch"]:
+        """Deprecated name of :meth:`search_pages_semantic`, still called when a store overrides it. Remove in 2.x."""
+        raise NotImplementedError("this store does not index pages")
 
-        Separate from :meth:`search_knowledge_pages` because the two want different answers, not
-        different tunings of one: this one reports ``score`` as a **similarity in [0, 1]**, which
-        the agent surfaces as a relevance figure, and a fused hybrid score cannot stand in for it.
-
-        ``exclude_ids`` drops pages from the result — a refresh must not retrieve the very page it
-        is regenerating."""
-        raise NotImplementedError("this store does not index knowledge pages")
-
-    async def list_knowledge_pages(self, bank_id: str) -> list["KnowledgePageRef"]:
-        """Every page the store currently indexes for this bank.
-
-        The read half of the reconcile: diff it against the bank's `mental_models` rows to find both
-        what is missing from the index and what is left over in it. Bounded by the bank's page
-        count, which is a curated set rather than its corpus."""
-        raise NotImplementedError("this store does not index knowledge pages")
+    async def list_knowledge_pages(self, bank_id: str) -> list["PageRef"]:
+        """Deprecated name of :meth:`list_pages`, still called when a store overrides it. Remove in 2.x."""
+        raise NotImplementedError("this store does not index pages")
 
     async def retain(
         self,
@@ -1970,7 +2056,7 @@ class MemoriesExtension(Extension, ABC):
         returns rather than what it reads.
         """
 
-    async def _scan_all_memories(self, **filters: Any) -> list[StoredMemory]:
+    async def scan_all_memories(self, **filters: Any) -> list[StoredMemory]:
         """Every memory :meth:`scan_memories` matches for ``filters``, paged to the end.
 
         Never one oversized page: a store caps what one page holds, so a single call with a huge
@@ -2166,7 +2252,7 @@ class MemoriesExtension(Extension, ABC):
     ) -> dict[str, bool]:
         """:meth:`any_memory_updated_since` for many scopes at once, keyed by ``scope.key``.
 
-        The knowledge tree and the mental-model list both need the answer for
+        The page tree and the mental-model list both need the answer for
         every model in a bank on one read, and asking one at a time makes the
         round-trips, not the scans, the cost. A store that can answer them
         together should override this; the default is the honest loop, so a
@@ -2234,7 +2320,7 @@ class MemoriesExtension(Extension, ABC):
     ) -> list[StoredMemory] | None:
         """The memories in :meth:`newest_memory_updated_at`'s scope and window, oldest first.
 
-        A delta knowledge-page refresh reads them to ask a decision model which could
+        A delta page refresh reads them to ask a decision model which could
         change the page, instead of searching for them. None means this store cannot
         list them, and the refresh searches as it always has.
         """
@@ -2262,6 +2348,27 @@ class MemoriesExtension(Extension, ABC):
         """
         fresh = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
         return fresh.get("last_memory_write_at")
+
+    async def reflect_freshness(self, *, conn, fq_table, bank_id: str) -> ReflectFreshness:
+        """What reflect reads about the bank before it starts.
+
+        Reflect waits on this, so it may be cheaper than :meth:`consolidation_freshness`, and
+        each value may be loose in one direction only:
+
+        - ``pending`` may lag the bank's writes. Reflect only turns it into a hint for the
+          model (up to date, slightly stale, stale), so a count a few seconds old is fine.
+        - ``last_memory_write_at`` may be LATER than the bank's newest write, never earlier.
+          Reflect rules a mental model fresh without a scoped check when the model read the
+          memories at or after it, so an earlier value would call a stale model fresh. A
+          later one only costs that model its scoped check. None means the bank is empty.
+
+        The gates that act on ``pending`` (the retraction deferral, the refresh scheduler)
+        stay on :meth:`consolidation_freshness`, which is exact.
+
+        The default is :meth:`consolidation_freshness`, which meets both rules exactly.
+        """
+        fresh = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        return ReflectFreshness(pending=fresh["pending"], last_memory_write_at=fresh.get("last_memory_write_at"))
 
     async def live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[Any]) -> set[str]:
         """Which of ``unit_ids`` still exist among the bank's live memories.
@@ -2329,16 +2436,22 @@ class MemoriesExtension(Extension, ABC):
 
         ``pending`` / ``failed`` count the world/experience facts not yet folded
         into an observation, and those the LLM gave up on. Backs
-        ``get_bank_freshness``, which reflect() calls often, so keep it cheap.
+        ``get_bank_freshness`` and the gates that act on ``pending``, so it must be
+        exact; reflect reads the looser :meth:`reflect_freshness` instead.
 
         ``last_memory_write_at`` is the newest write time (``updated_at``) across
         the bank's memories, or None for an empty bank. It is the bank-wide
         counterpart of :meth:`any_memory_updated_since`: a mental model whose
         ``last_memory_seen_at`` is at or after it cannot be stale, whatever its
-        scope — which is how the stats and knowledge-tree surfaces answer "is
+        scope — which is how the stats and page-tree surfaces answer "is
         this up to date" for many models without a scoped scan each.
         """
         raise NotImplementedError
+
+    async def has_pending_consolidation(self, *, conn, fq_table, bank_id: str) -> bool:
+        """Whether the bank has any facts that can still be consolidated."""
+        freshness = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        return bool(freshness.get("pending"))
 
     async def document_memory_counts(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
         """Live memory count per document id, for the documents named. Absent = 0."""
@@ -3020,7 +3133,7 @@ class MemoriesExtension(Extension, ABC):
             # take it off, so the payload is the same shape on either backend.
             "attachment_filenames": document_attachment_filenames(_rec),
         }
-        _units = await self._scan_all_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
+        _units = await self.scan_all_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
         doc["unit_count"] = len(_units)
         doc["world_count"] = sum(1 for m in _units if m.fact_type == "world")
         doc["experience_count"] = sum(1 for m in _units if m.fact_type == "experience")
@@ -3039,7 +3152,7 @@ class MemoriesExtension(Extension, ABC):
 
         Default: a scan of the document's memories and :meth:`document_memory_counts`. Postgres
         reads `memory_units`."""
-        sources = await self._scan_all_memories(
+        sources = await self.scan_all_memories(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, fact_types=["experience", "world"]
         )
         _doc_counts = await self.document_memory_counts(
@@ -3083,8 +3196,15 @@ class MemoriesExtension(Extension, ABC):
         await self.delete_document_record(bank_id=bank_id, document_id=document_id)
         return DeletedDocument(deleted=_record is not None, file_storage_key=file_storage_key)
 
-    async def current_document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> DocumentTags:
+    async def current_document_tags(
+        self, *, conn, fq_table, bank_id: str, document_id: str, for_update: bool = False
+    ) -> DocumentTags:
         """The tags a document carries now, read before a retag overwrites them.
+
+        ``for_update`` asks the store to hold the document until ``conn``'s transaction ends, so
+        a tag change decided from this read (a partial add/remove, or whether a full write must
+        retag the memories) is not undone by a concurrent one. The default record-based read
+        cannot lock and ignores it.
 
         Default: the store's record. A record that does not carry a "tags" key at all is
         unreadable for this purpose, not empty — collapsing it to [] would read a PATCH of []
@@ -3094,6 +3214,25 @@ class MemoriesExtension(Extension, ABC):
             found=_record is not None,
             tags=list(_record["tags"] or []) if _record is not None and "tags" in _record else None,
         )
+
+    async def existing_documents_tags(
+        self, *, conn, fq_table, bank_id: str, document_ids: list[str]
+    ) -> dict[str, list[str] | None]:
+        """document id -> its tags, for the ids that exist; ``None`` when the record exists but
+        carries no tags (same meaning as :meth:`current_document_tags`). Read to check a retain
+        batch's writes into existing documents, so an id left out is a new document.
+
+        Default: :meth:`current_document_tags` per id. Not :meth:`documents_tags`: that one
+        leaves out a record without a "tags" key, so a restricted writer's retain would read it
+        as a new document and be let through (#6327). Postgres reads all the rows at once."""
+        out: dict[str, list[str] | None] = {}
+        for document_id in document_ids:
+            current = await self.current_document_tags(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
+            )
+            if current.found:
+                out[document_id] = current.tags
+        return out
 
     async def documents_tags(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, list[str]]:
         """document id -> the tags it carries, for the ids that exist. Read to decide whether a
@@ -3162,7 +3301,7 @@ class MemoriesExtension(Extension, ABC):
         :meth:`delete_stale_observations` (which requeues surviving co-sources) and
         :meth:`mark_consolidated`. Postgres runs the same cascade as SQL."""
         invalidated_obs = 0
-        _doc_units = await self._scan_all_memories(
+        _doc_units = await self.scan_all_memories(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
         )
         from ..consolidation.consolidator import write_scopes_changed
@@ -3336,7 +3475,7 @@ class MemoriesExtension(Extension, ABC):
         if fact_type in ("experience", "world"):
             unit_ids = [
                 m.unit_id
-                for m in await self._scan_all_memories(
+                for m in await self.scan_all_memories(
                     conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=[fact_type]
                 )
             ]
@@ -3395,7 +3534,7 @@ class MemoriesExtension(Extension, ABC):
         await self.delete_observations(conn=conn, fq_table=fq_table, bank_id=bank_id)
         src_ids = [
             m.unit_id
-            for m in await self._scan_all_memories(
+            for m in await self.scan_all_memories(
                 conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=["experience", "world"]
             )
         ]
@@ -3592,10 +3731,17 @@ class MemoriesExtension(Extension, ABC):
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id, include_text=include_text)
         return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=include_text)
 
-    async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:
-        """The document's chunks (id, index, content hash), in chunk order."""
+    async def load_existing_chunks(
+        self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
+    ) -> list[ExistingChunk]:
+        """The document's chunks (id, index, content hash), in chunk order; ``chunk_indices`` limits
+        the result to those positions."""
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id)
-        return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=False).chunks
+        chunks = document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=False).chunks
+        if chunk_indices is None:
+            return chunks
+        wanted = set(chunk_indices)
+        return [c for c in chunks if c.chunk_index in wanted]
 
     async def current_document_hash(self, *, backend, fq_table, bank_id: str, document_id: str) -> str | None:
         """The document's content_hash now, for the delta's pre-extraction recheck. ``backend`` is
@@ -3677,7 +3823,7 @@ class MemoriesExtension(Extension, ABC):
         from ..consolidation.consolidator import write_scopes_changed
         from ..metadata_utils import drop_null_values
 
-        units = await self._scan_all_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
+        units = await self.scan_all_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
         # Metadata too, not just tags: a survivor left carrying the PREVIOUS retain's metadata is
         # exactly what this exists to prevent — measured on an append, older units still read
         # {"source": "email"} after a retain carrying {"source": "crm"}.
@@ -3706,7 +3852,8 @@ class MemoriesExtension(Extension, ABC):
                 },
             )
             for m in units
-            if m.tags != new_tags_by_unit[m.unit_id]
+            # As sets, like the Postgres relabel: tag order is not a label change (#6591).
+            if set(m.tags or []) != set(new_tags_by_unit[m.unit_id])
             or (m.metadata or {}) != new_metadata
             or m.observation_scopes != observation_scopes
         ]
@@ -3803,7 +3950,8 @@ class MemoriesExtension(Extension, ABC):
         entity_labels: list | None = None,
     ) -> EntityResolutionResult:
         """Resolve each unit's entity mentions to canonical entity ids, creating the missing ones
-        (autocommitted on ``conn``, outside the write transaction).
+        (autocommitted outside the write transaction, on ``conn`` or — when it is None — on short
+        holds the store takes itself).
 
         Empty here — the same answer retain's phase 1 gives a store-owned bank without asking:
         such a store resolves the names its write carries itself."""

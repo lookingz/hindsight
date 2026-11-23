@@ -115,6 +115,16 @@ Hindsight can append deployment-specific guidance to the `retain` and `recall` M
 export HINDSIGHT_API_MCP_INSTRUCTIONS="Use project:<name> tags for project-specific memories."
 ```
 
+### Per-bank server instructions
+
+A bank can carry its own MCP server instructions in its `mcp_server_instructions` config field. They are sent in the `initialize` response to every client that connects to the bank's single-bank endpoint (`/mcp/{bank_id}/`), so a newly connected agent knows how to use the bank without a hand-pasted prompt: which document to read first, which tags to save new facts with, and so on. Set it with the [bank config API](./configuration.mdx#mcp-server) or in the control plane's bank configuration.
+
+- The text is read when a client connects, so a change applies to the next connection.
+- At most 4,000 characters. Set it to `null` to remove it.
+- The multi-bank endpoint (`/mcp/`) does not send it: a multi-bank connection reaches every bank, so no one bank's instructions describe it.
+- How the text is used is up to the client. Clients that support MCP server instructions add them to the model's context; others ignore them.
+- Anyone who can change the bank's config can change what every connecting agent is told, including an agent with the `update_bank` tool. Restrict that tool with [`mcp_enabled_tools`](./api/memory-banks.mdx#mcp_enabled_tools) if connected agents should not edit it.
+
 MCP clients that read tool annotations also receive safety hints from the built-in tools:
 
 - Read-only operations such as `recall`, `reflect`, `list_*`, and `get_*` are marked with `readOnlyHint: true`.
@@ -370,7 +380,7 @@ Update a mental model's metadata or settings.
 
 ### Trigger settings
 
-`trigger` carries a mental model's (or knowledge page's) refresh policy: **when**
+`trigger` carries a mental model's (or page's) refresh policy: **when**
 it rebuilds itself and **what** it rebuilds from. It accepts every field the HTTP
 API accepts, so anything you can configure through `PATCH /mental_models/{id}`
 you can also configure from an agent over MCP.
@@ -399,7 +409,7 @@ model refreshes either after consolidation or on a schedule, never both. Setting
 one clears the other.
 
 **On create**, omitted fields take the engine defaults (`mode: full`, no
-schedule, all fact types); for a knowledge page they take the page defaults
+schedule, all fact types); for a page they take the page defaults
 (`mode: delta`, observation-only, auto-refresh, siblings excluded).
 
 **On update, `trigger` is a patch**: only the fields you send change, so putting
@@ -675,15 +685,15 @@ Clear all memories from a bank without deleting the bank itself. Optionally filt
 
 ---
 
-### get_knowledge_base_tree
+### get_page_tree
 
-Browse the knowledge base as a nested tree of folders and pages. Each page reports `is_stale`: `false` means it is provably up to date, `true` means the bank has been written to since the page last refreshed.
+Browse the bank's pages as a nested tree of folders and pages. Each page reports `is_stale`: `false` means it is provably up to date, `true` means the bank has been written to since the page last refreshed.
 
 ---
 
-### search_knowledge_base
+### search_pages
 
-Find knowledge pages by relevance (hybrid BM25 + vector search over page names and content). Returns ranked pages with a snippet each.
+Find pages by relevance (hybrid BM25 + vector search over page names and content). Returns ranked pages with a snippet each.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -692,9 +702,9 @@ Find knowledge pages by relevance (hybrid BM25 + vector search over page names a
 
 ---
 
-### get_knowledge_page
+### get_page
 
-Read a knowledge page as a markdown document (YAML frontmatter + synthesized body).
+Read a page as a markdown document (YAML frontmatter + synthesized body).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -702,9 +712,9 @@ Read a knowledge page as a markdown document (YAML frontmatter + synthesized bod
 
 ---
 
-### create_knowledge_folder
+### create_page_folder
 
-Create a folder in the knowledge base. Folders group pages and hold no content of their own.
+Create a folder for pages. Folders group pages and hold no content of their own.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -713,7 +723,7 @@ Create a folder in the knowledge base. Folders group pages and hold no content o
 
 ---
 
-### create_knowledge_page
+### create_page
 
 Create a page — a living document whose content is synthesized from the bank's memories by running `source_query`. Content is generated asynchronously; use the returned `operation_id` to track completion.
 
@@ -724,7 +734,7 @@ Create a page — a living document whose content is synthesized from the bank's
 | `parent_id` | string | No | Parent folder id (a `kf-...` node id). Omit to create at the top level |
 | `tags` | array | No | Tags scoping which memories the page is built from |
 | `max_tokens` | integer | No | Maximum tokens for the generated content (default: 4096) |
-| `trigger` | object | No | Refresh policy — see [Trigger settings](#trigger-settings). Omitted fields keep the knowledge-page defaults: `delta` rebuilds from consolidated observations after each consolidation, ignoring sibling pages |
+| `trigger` | object | No | Refresh policy — see [Trigger settings](#trigger-settings). Omitted fields keep the page defaults: `delta` rebuilds from consolidated observations after each consolidation, ignoring sibling pages |
 | `refresh_after_consolidation` | boolean | No | Legacy shorthand for `trigger.refresh_after_consolidation` |
 
 Set `trigger.refresh_cron` to move a page off consolidation-driven rebuilds and
@@ -733,7 +743,7 @@ the auto-refresh while leaving the page's `mode` and `fact_types` alone.
 
 ---
 
-### update_knowledge_node
+### update_page_node
 
 Rename or move a folder/page, and/or update a page's options. Only the arguments you pass are changed. Changing `source_query` schedules an async refresh so the page rebuilds against the new question.
 
@@ -750,7 +760,7 @@ Rename or move a folder/page, and/or update a page's options. Only the arguments
 
 ---
 
-### delete_knowledge_node
+### delete_page_node
 
 Delete a folder or page and its whole subtree. Each deleted page takes its backing mental model with it.
 
@@ -759,9 +769,9 @@ Delete a folder or page and its whole subtree. Each deleted page takes its backi
 | `node_id` | string | Yes | The folder (`kf-...`) or page (`kp-...`) to delete |
 
 :::note
-Exporting the knowledge base is deliberately not an MCP tool — it returns the whole
+Exporting pages is deliberately not an MCP tool — it returns the whole
 bank as a single markdown bundle. Use the HTTP endpoint
-`GET /v1/default/banks/{bank_id}/knowledge-base/export` instead.
+`GET /v1/default/banks/{bank_id}/pages/export` instead.
 :::
 
 ---
