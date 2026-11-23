@@ -190,8 +190,12 @@ Then run `docker compose up -d hindsight`.
   public for deployment checks.
 - This is a single shared-key gate, not user accounts, roles or per-user memory
   isolation. The built-in API-key tenant still uses the `public` schema.
-- Expose only control-plane port 9999 through the tunnel. Keep dataplane 8888 on
-  loopback; the control plane calls it internally with the Bearer key.
+- By default, expose only control-plane port 9999 through the tunnel. Keep
+  dataplane 8888 on loopback; the control plane calls it internally with the
+  Bearer key.
+- If external agents need direct API access, a separate authenticated tunnel to
+  8888 is also supported. Do not point agents at the control-plane hostname:
+  its middleware redirects `/v1/...` and `/health/...` to the UI login page.
 
 A cpolar tunnel entry looks like this (use your own reserved subdomain and
 follow the host's shared-tunnel procedures; do not start a second cpolar):
@@ -205,6 +209,22 @@ follow the host's shared-tunnel procedures; do not start a second cpolar):
     bind_tls: true
     inspect: false
 ```
+
+Optional second tunnel for external agents (requires the API Bearer key above):
+
+```yaml
+  hindsight-api:
+    proto: http
+    addr: 127.0.0.1:8888
+    region: cn_vip
+    subdomain: <reserved-api-subdomain>
+    bind_tls: true
+    inspect: false
+```
+
+Agents then use `https://<reserved-api-subdomain>.vip.cpolar.cn/v1/default` and
+`Authorization: Bearer <HINDSIGHT_API_TENANT_API_KEY>`. `/health/live` and
+`/health` stay public; data endpoints reject missing or wrong keys with 401.
 
 ## Verification
 
