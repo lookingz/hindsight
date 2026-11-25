@@ -328,6 +328,15 @@ archive was written.
 - Set a stable `HINDSIGHT_API_WORKER_ID` for Docker deployments. Otherwise the worker defaults to the container hostname, and recreated containers can leave async tasks stuck in `processing`.
 - The API needs working LLM and embeddings keys to start at all: it verifies both connections during startup and exits otherwise (`scripts/deploy-cn.sh` then fails its health check). To initialize a fresh database before the keys are in place, run `docker compose run --rm --no-deps --entrypoint hindsight-admin hindsight run-db-migration`.
 - `LITELLM_LOCAL_MODEL_COST_MAP=True` (set by the override) skips LiteLLM's startup fetch of its price table from `raw.githubusercontent.com`, which otherwise stalls every start where that host is unreachable.
+- `Unknown retain strategy 'conversation'` in the logs means a client is naming, per item, a strategy the bank does not have. The `coding-agents` integration does this (`git`, `gitlog`, `conversation`, `document`, `survey`) and normally seeds them into the bank at session start; a bank it auto-created on first write can miss that. The server does not reject the request - it extracts with the bank's own rules, so a long conversation is split into 3000-character chunks and each one costs an extraction call. Give the bank the strategies. The plugin only ever adds what is missing, so seeding them by hand is safe; `GET .../config` on a bank it did seed returns them under `overrides.retain_strategies`:
+
+  ```bash
+  curl -X PATCH -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+    http://localhost:8888/v1/default/banks/<bank>/config \
+    -d "{\"updates\": {\"retain_strategies\": <that map>}}"
+  ```
+
+  The `updates` wrapper is required; without it the endpoint answers 422.
 - For `qwen3.8-flash` through DashScope, set `HINDSIGHT_API_LLM_EXTRA_BODY={"enable_thinking":false}` when reflect latency matters. The default thinking mode emits reasoning content; in one deployment it made complex reflect calls repeatedly hit the 30-second per-request timeout and the whole operation return 504. Disabling it also speeds retain/consolidation. Keep `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` at its 30-second default unless measurements show healthy calls need more.
 
 ## Async worker caveat for single-schema deployments
