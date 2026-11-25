@@ -59,6 +59,9 @@ Runtime:
 - `HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY`
 - `HINDSIGHT_API_RERANKER_PROVIDER=local`
 - `HINDSIGHT_API_RERANKER_LOCAL_MODEL`
+- `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING` - opt-in length-sorted batching
+  for the local reranker; same scores, less padding. On when the model is
+  `hindsight-ai/hs-rerank-1`.
 - `HINDSIGHT_API_WORKER_ID=hindsight-app`
 
 Deployment:
@@ -323,6 +326,9 @@ archive was written.
     'python -c "from huggingface_hub import snapshot_download; snapshot_download(\"cross-encoder/ms-marco-MiniLM-L-6-v2\")" \
      && chown -R 1000:1000 /home/hindsight/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2'
   ```
+
+  A deployment on the preloaded `hindsight-ai/hs-rerank-1` needs none of this:
+  drop the mount and the volume. This one kept both, unused, after switching.
 - The base file gives only the database a restart policy; the override adds
   `restart: always` for the app so it comes back after a crash or a reboot.
 - Set a stable `HINDSIGHT_API_WORKER_ID` for Docker deployments. Otherwise the worker defaults to the container hostname, and recreated containers can leave async tasks stuck in `processing`.
@@ -354,11 +360,26 @@ archive was written.
   For such a bank, register `conversation` with the bank's own defaults instead,
   `{"retain_chunk_size": 3000, "retain_extraction_mode": "concise"}` and no
   mission. That silences the warning and keeps the server's general extraction
-  rules, which already cover personal facts, preferences, events and plans. The
-  document text is kept (`store_document_text`), so a later change can extract
-  it again. The other four strategies are only used for git commits, documents
-  and codebase surveys, and do nothing until a client names them.
-- `HINDSIGHT_API_RERANKER_LOCAL_MODEL` names the local reranker. `cross-encoder/ms-marco-MiniLM-L-6-v2` is an English model; the image also ships the service's default, `hindsight-ai/hs-rerank-1`, which is multilingual and trained for Hindsight memory reranking. The difference matters most through recall's combined scoring: `sigmoid(rerank score) * recency boost * proof-count boost`. A model that scores many candidates between 5 and 8 saturates under the sigmoid, so the boosts decide the order and relevance stops mattering. A 123-question comparison on real memories (2026-11-25) scored judged nDCG@5 at 0.17 for ms-marco and 0.91 for hs-rerank-1, and put the answer in the top 5 for 11% versus 93% of questions. On an E5-2697 v2 hs-rerank-1 costs 29% more per candidate (96 ms against 75 ms); with `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=true` it is faster than ms-marco is today (61 ms), with identical scores. Both settings are env-only and need a container recreate.
+  rules, which already cover personal facts, preferences, events and plans; the
+  seven macpro banks carry this since 2026-11-25. Checked on three real
+  conversation samples: the plugin's strategy left memories stating 21 of the
+  115 things the labeller found the user saying in them, the defaults 80. A
+  short invented transcript showed no such difference, so test on real
+  conversations. The document text is kept (`store_document_text`), so a later
+  change can extract it again, and a change to the chunk size makes the next
+  write-back do so by itself. The other four strategies are only used for git
+  commits, documents and codebase surveys, and do nothing until a client names
+  them.
+- `HINDSIGHT_API_RERANKER_LOCAL_MODEL` names the local reranker. This deployment
+  moved from `cross-encoder/ms-marco-MiniLM-L-6-v2` (English) to the service's
+  default, `hindsight-ai/hs-rerank-1` (multilingual, trained for Hindsight
+  memory reranking), on 2026-11-25.
+
+  - The choice matters most through recall's combined scoring: `sigmoid(rerank score) * recency boost * proof-count boost`. A model that scores many candidates between 5 and 8 saturates under the sigmoid, so the boosts decide the order and relevance stops mattering.
+  - Evidence on real memories: a 123-question comparison scored judged nDCG@5 at 0.17 for ms-marco and 0.91 for hs-rerank-1, with the answer in the top 5 for 11% versus 93% of questions. After the switch, 28 fresh questions asked of the live API put the source memory in the top 5 for 27 of them (0 before the switch, on the same candidates); its median rank went from 148 to 2.
+  - Measure speed on the text the service really scores. It is not the memory's text but `[Date: <readable> (<iso>)] <document context>: <text>` (`engine/search/reranking.py`), and a client's context can be longer than the memory itself. In an idle container from the deployed image, default torch threads (12 on an E5-2697 v2), same candidates: ms-marco 101 ms per candidate; hs-rerank-1 80 ms with `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=true` and 145 ms without. On bare text the three are 82, 53 and 107. A probe that scores bare text, or pins a thread count the service does not use, does not predict production.
+  - Length-sorted batching leaves every score as it was (largest difference 4e-6 over 284 candidates).
+  - Switching or rolling back is an env change plus `docker compose up -d --no-build hindsight`; the app reported healthy 41 s after the recreate. With hs-rerank-1 the ms-marco cache mount described above is unused.
 - For `qwen3.8-flash` through DashScope, set `HINDSIGHT_API_LLM_EXTRA_BODY={"enable_thinking":false}` when reflect latency matters. The default thinking mode emits reasoning content; in one deployment it made complex reflect calls repeatedly hit the 30-second per-request timeout and the whole operation return 504. Disabling it also speeds retain/consolidation. Keep `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` at its 30-second default unless measurements show healthy calls need more.
 
 ## Async worker caveat for single-schema deployments
