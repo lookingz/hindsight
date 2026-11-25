@@ -274,7 +274,8 @@ run logs `未配置异地上传` and keeps a local archive only. Once it is set,
 failed upload fails the run, so `systemctl --user --failed` shows a broken
 credential instead of a successful-looking job. The archive goes up under a
 temporary name, is moved into place, then is downloaded again and compared by
-SHA-256.
+SHA-256. Verified against Jianguoyun's WebDAV on 2026-11-25, including a
+restore drill from the downloaded copy.
 
 `UPLOAD_EVERY_N_DAYS` spaces uploads out for a WebDAV account that caps monthly
 upload traffic: a 30 MB database is about 0.9 GB a month at one upload a day,
