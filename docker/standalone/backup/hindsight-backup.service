@@ -1,0 +1,11 @@
+[Unit]
+Description=Hindsight database backup (local archive, optional WebDAV off-site copy)
+
+[Service]
+Type=oneshot
+# %h is the service user's home, so the script lives in <home>/services/hindsight/backup/
+ExecStart=/usr/bin/python3 %h/services/hindsight/backup/backup-cn.py run
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600

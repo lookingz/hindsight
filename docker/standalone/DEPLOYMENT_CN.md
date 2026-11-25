@@ -226,6 +226,65 @@ Agents then use `https://<reserved-api-subdomain>.vip.cpolar.cn/v1/default` and
 `Authorization: Bearer <HINDSIGHT_API_TENANT_API_KEY>`. `/health/live` and
 `/health` stay public; data endpoints reject missing or wrong keys with 401.
 
+## Backups
+
+`docker/standalone/backup/` is a host-side backup job with the same shape as the
+Supabase -> Jianguoyun scheme: one timestamped ZIP per run, day-based local
+retention and an optional WebDAV off-site copy. It needs only python3, curl and
+docker.
+
+The ZIP holds a plain `pg_dump` custom-format dump, `roles.sql` (no password
+hashes) and a manifest, so it restores into a fresh PostgreSQL with the same
+major version and extensions - no Hindsight needs to be running:
+
+```bash
+docker exec -i <pg container> pg_restore -U hindsight -d hindsight < hindsight.dump
+```
+
+Install it next to the compose entry:
+
+```bash
+mkdir -m 700 <deploy-dir>/backup
+cp docker/standalone/backup/backup-cn.py <deploy-dir>/backup/
+cp docker/standalone/backup/config.example <deploy-dir>/backup/config
+chmod 600 <deploy-dir>/backup/config
+cp docker/standalone/backup/*.service docker/standalone/backup/*.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hindsight-backup.timer hindsight-restore-drill.timer
+```
+
+- `hindsight-backup.timer` runs daily at 02:00 host time (`Persistent=true`):
+  a local archive, then the off-site copy once that is configured.
+- `hindsight-restore-drill.timer` runs weekly. It restores the newest archive
+  into a throwaway container with no network and compares every table's row
+  count with the manifest, which is taken from the same snapshot as the dump.
+  A backup is only proven by a passing drill, not by the unit's exit code.
+
+| Command (run `python3 <deploy-dir>/backup/backup-cn.py ...`) | Does |
+| --- | --- |
+| `status` | Settings, archives, timer state, last successful upload |
+| `run` | Back up now |
+| `drill` | Restore the newest archive and verify it |
+| `upload --zip <archive>` | Upload (again) one local archive |
+
+**Off-site copy.** Copy `webdav.env.example` to `webdav.env` (mode 600) with
+`WEBDAV_USERNAME` and `WEBDAV_PASSWORD` - for Jianguoyun, the login email and
+an app password - then set `UPLOAD_PROVIDER=webdav` in `config`. Until then each
+run logs `未配置异地上传` and keeps a local archive only. Once it is set, a
+failed upload fails the run, so `systemctl --user --failed` shows a broken
+credential instead of a successful-looking job. The archive goes up under a
+temporary name, is moved into place, then is downloaded again and compared by
+SHA-256.
+
+`UPLOAD_EVERY_N_DAYS` spaces uploads out for a WebDAV account that caps monthly
+upload traffic: a 30 MB database is about 0.9 GB a month at one upload a day,
+and the read-back counts as download traffic.
+
+In the journal, success is the `SUMMARY {"result": "ok", ... "offsite":
+"uploaded"}` line. `offsite` is `not_configured` while credentials are missing
+and `skipped_interval` inside the upload interval; both still mean a local
+archive was written.
+
 ## Verification
 
 - API: `http://localhost:8888` (liveness: `/health/live`, readiness: `/health`)

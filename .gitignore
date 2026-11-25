@@ -84,3 +84,6 @@ docker-compose.override.yaml
 .deploy-env.local
 # Stale pre-relocation copy of the (now tracked) hs-upgrade skill
 .claude/skills/hs-upgrade/
+# Host-local backup settings and WebDAV credentials
+docker/standalone/backup/config
+docker/standalone/backup/webdav.env

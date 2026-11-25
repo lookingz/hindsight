@@ -1,0 +1,10 @@
+[Unit]
+Description=Hindsight backup restore drill (throwaway container, no network)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/services/hindsight/backup/backup-cn.py drill
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=1800

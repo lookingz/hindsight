@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Hindsight database backup
+
+[Timer]
+# 02:00 in the host's timezone, like the Supabase backup scheme
+OnCalendar=*-*-* 02:00:00
+# A run missed while the host was off happens at the next start
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
