@@ -337,6 +337,27 @@ archive was written.
   ```
 
   The `updates` wrapper is required; without it the endpoint answers 422.
+
+  Check what a bank holds before giving it the plugin's `conversation` strategy
+  by hand. That strategy is written for developer conversations: its mission asks
+  for the fewest facts that capture the outcome (settled decisions, changes to
+  code entities), and it sets `retain_chunk_size` to 12000. In a bank that holds
+  other kinds of conversation, two things follow:
+
+  - the next session write-back re-chunks the whole document, every chunk counts
+    as changed, and the entire conversation is extracted again under that
+    mission, replacing its facts (on macpro the whole store went from 3958 to
+    about 1350 memory units the same day, almost all of it in banks that hold
+    personal conversations);
+  - facts that are not decisions or outcomes are mostly dropped.
+
+  For such a bank, register `conversation` with the bank's own defaults instead,
+  `{"retain_chunk_size": 3000, "retain_extraction_mode": "concise"}` and no
+  mission. That silences the warning and keeps the server's general extraction
+  rules, which already cover personal facts, preferences, events and plans. The
+  document text is kept (`store_document_text`), so a later change can extract
+  it again. The other four strategies are only used for git commits, documents
+  and codebase surveys, and do nothing until a client names them.
 - `HINDSIGHT_API_RERANKER_LOCAL_MODEL` names the local reranker. `cross-encoder/ms-marco-MiniLM-L-6-v2` is an English model; the image also ships the service's default, `hindsight-ai/hs-rerank-1`, which is multilingual and trained for Hindsight memory reranking. The difference matters most through recall's combined scoring: `sigmoid(rerank score) * recency boost * proof-count boost`. A model that scores many candidates between 5 and 8 saturates under the sigmoid, so the boosts decide the order and relevance stops mattering. A 123-question comparison on real memories (2026-11-25) scored judged nDCG@5 at 0.17 for ms-marco and 0.91 for hs-rerank-1, and put the answer in the top 5 for 11% versus 93% of questions. On an E5-2697 v2 hs-rerank-1 costs 29% more per candidate (96 ms against 75 ms); with `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=true` it is faster than ms-marco is today (61 ms), with identical scores. Both settings are env-only and need a container recreate.
 - For `qwen3.8-flash` through DashScope, set `HINDSIGHT_API_LLM_EXTRA_BODY={"enable_thinking":false}` when reflect latency matters. The default thinking mode emits reasoning content; in one deployment it made complex reflect calls repeatedly hit the 30-second per-request timeout and the whole operation return 504. Disabling it also speeds retain/consolidation. Keep `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` at its 30-second default unless measurements show healthy calls need more.
 
