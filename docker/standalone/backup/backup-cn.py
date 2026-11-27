@@ -604,14 +604,21 @@ def last_upload(cfg: dict[str, str]) -> dt.datetime | None:
 
 
 def due_for_upload(cfg: dict[str, str]) -> tuple[bool, str]:
+    """Whether this run should upload, going by the marker a successful upload leaves behind.
+
+    Days are counted by calendar date, not as 24-hour periods. The timer fires
+    once a night at a randomly delayed minute: against a strict 24 hours, the
+    next night's run was "not due" whenever it started a few minutes earlier
+    than the previous one had finished, and so was the night after a manual
+    upload during the day. Either way a day's archive never left the host."""
     every = int(cfg["UPLOAD_EVERY_N_DAYS"])
     previous = last_upload(cfg)
     if previous is None:
         return True, "从未上传过"
-    age = dt.datetime.now() - previous
-    if age >= dt.timedelta(days=every):
-        return True, f"距上次成功上传 {age.days} 天"
-    return False, f"距上次成功上传不足 {every} 天（{age.days} 天 {age.seconds // 3600} 小时）"
+    days = (dt.datetime.now().date() - previous.date()).days
+    if days >= every:
+        return True, f"上次成功上传于 {previous:%Y-%m-%d %H:%M}，已相隔 {days} 天"
+    return False, f"上次成功上传于 {previous:%Y-%m-%d %H:%M}，按 UPLOAD_EVERY_N_DAYS={every} 今天不必再传"
 
 
 def run_backup(cfg: dict[str, str]) -> None:

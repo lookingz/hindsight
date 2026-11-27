@@ -280,9 +280,25 @@ temporary name, is moved into place, then is downloaded again and compared by
 SHA-256. Verified against Jianguoyun's WebDAV on 2026-11-25, including a
 restore drill from the downloaded copy.
 
+`WEBDAV_BASE_DIR` is relative to `WEBDAV_URL` and missing levels are created,
+so the archives can sit inside a folder that is already there. On macpro they
+moved from `/dav/hindsight/` to `/dav/ns_ServerBackups/hindsight/` on
+2026-11-27 with a WebDAV `MOVE` per file (nothing re-uploaded), then the newest
+was read back from its new place and compared by SHA-256. Two Jianguoyun
+quirks showed up: it answers 403 to `DELETE` on a folder, and it lists only
+folders that are not empty, so the emptied folder is invisible over WebDAV
+until someone removes it in the Jianguoyun client.
+
 `UPLOAD_EVERY_N_DAYS` spaces uploads out for a WebDAV account that caps monthly
 upload traffic: a 30 MB database is about 0.9 GB a month at one upload a day,
-and the read-back counts as download traffic.
+and the read-back counts as download traffic. The interval is counted by
+calendar date, not as 24-hour periods. The timer fires at a randomly delayed
+minute, so against a strict 24 hours the next night's run was skipped whenever
+it started a few minutes earlier than the previous upload had finished, and so
+was the night after a manual upload during the day. The macpro archive of
+2026-11-26 stayed local that way and was uploaded by hand after the fix on
+2026-11-27. `python3 -m unittest discover -s docker/standalone/backup -p
+'test_*.py'` covers the rule and needs neither docker nor a network.
 
 In the journal, success is the `SUMMARY {"result": "ok", ... "offsite":
 "uploaded"}` line. `offsite` is `not_configured` while credentials are missing

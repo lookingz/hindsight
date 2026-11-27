@@ -20,11 +20,14 @@ KEEP_REMOTE_DAYS=30
 # webdav.env holds the credentials. Once it is set, a failed upload fails the
 # whole run, so a broken credential never looks like a successful backup.
 UPLOAD_PROVIDER=
-# Days between uploads. Local archives are still made daily. Raise this when
-# the WebDAV account has a monthly upload-traffic cap; each run also downloads
-# the archive again to verify it, which counts as download traffic.
+# Days between uploads, counted by calendar date: with 1, every day's run
+# uploads. Local archives are still made daily. Raise this when the WebDAV
+# account has a monthly upload-traffic cap; each run also downloads the archive
+# again to verify it, which counts as download traffic.
 UPLOAD_EVERY_N_DAYS=1
 # Jianguoyun's WebDAV service address.
 WEBDAV_URL=https://dav.jianguoyun.com/dav/
-# Project directory on the remote. Give each project or environment its own.
+# Project directory on the remote, relative to WEBDAV_URL. Missing levels are
+# created, so it can sit inside a folder that is already there
+# (ns_ServerBackups/hindsight). Give each project or environment its own.
 WEBDAV_BASE_DIR=hindsight
